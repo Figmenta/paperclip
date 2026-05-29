@@ -2,23 +2,21 @@
 # Paperclip atomic deploy — FIG-763 F1.
 # Only sanctioned way to change running prod code on VPS-3 DBAGENTS.
 #
-# Fork-tracking policy (Federico 2026-05-29 via FIG-763): align ONLY to upstream
-# STABLE tags (vYYYY.MMDD.0). Never to upstream/master, never to canary tags.
-# Local fork patches rebase onto each new stable base; conflicts surface in F2
-# staging before prod ever sees them.
+# Fork-tracking policy (Federico 2026-05-29): align ONLY to upstream STABLE tags
+# (vYYYY.MMDD.0). Never to upstream/master, never to canary tags. Local fork
+# patches rebase onto each new stable base; conflicts surface in F2 staging
+# before prod ever sees them.
+#
+# No-root operation (Federico 2026-05-29T19:21Z): NO sudo, no NOPASSWD asks,
+# no privilege escalation in the deploy path. Restart is unprivileged:
+# kill -TERM the systemd MainPID (process is User=ivan, so ivan owns it) and
+# rely on the unit's Restart=always to respawn within RestartSec. systemd's
+# KillMode=control-group cleans up the whole cgroup (tsx + embedded postgres)
+# before respawn, so no datadir-lock race.
 #
 # Usage:
 #   ./deploy-paperclip.sh --tag vYYYY.MMDD.0 [--dry-run]
 #   ./deploy-paperclip.sh --ref <sha-or-branch> --allow-non-tag [--dry-run]
-#
-# --tag is the canonical surface. --ref + --allow-non-tag is the operator escape
-# hatch for emergencies (e.g. hot-fix on a local branch) — every non-tag deploy
-# is logged with a TAG=NONE banner so audit can find it.
-#
-# Requires: ivan has NOPASSWD on `systemctl restart paperclip` (configured by
-# Federico). The systemd unit /etc/systemd/system/paperclip.service is the
-# existing supervisor (shipped under FIG-443 on 2026-05-19, currently active+
-# enabled with Restart=always).
 
 set -euo pipefail
 
@@ -30,6 +28,8 @@ LOG_FILE="${STATE_DIR}/deploy.log"
 DATABASE_URL="${DATABASE_URL:-postgres://paperclip:paperclip@127.0.0.1:54329/paperclip}"
 HEALTH_URL="http://127.0.0.1:3100/api/health"
 HEALTH_TIMEOUT_SECONDS=60
+RESPAWN_TIMEOUT_SECONDS=30
+SYSTEMD_UNIT="paperclip"
 TARGET_REF=""
 TARGET_TAG=""
 ALLOW_NON_TAG=0
@@ -38,8 +38,7 @@ SKIP_STAGE_CONFIRM=0
 CURRENT_HEAD=""
 PRE_DUMP=""
 
-# Stable-tag pattern: vYYYY.MMDD.N where N is a non-negative integer.
-# Rejects: -canary, -beta, -rc, -anything-with-suffix.
+# Stable-tag pattern: vYYYY.MMDD.N. Rejects -canary, -beta, -rc, any suffix.
 STABLE_TAG_PATTERN='^v[0-9]{4}\.[0-9]{1,3}\.[0-9]+$'
 
 # ---- args ------------------------------------------------------------------
@@ -70,6 +69,38 @@ run() {
 
 die() { echo "FATAL: $*" >&2; exit 1; }
 
+# unprivileged restart: SIGTERM MainPID, poll for new PID up to RESPAWN_TIMEOUT.
+restart_paperclip_noroot() {
+  local old_pid
+  old_pid="$(systemctl show "$SYSTEMD_UNIT" -p MainPID --value || echo 0)"
+  if [[ "$old_pid" -le 1 ]]; then
+    die "no live MainPID for ${SYSTEMD_UNIT} (got '${old_pid}') — unit not active"
+  fi
+  if ! kill -0 "$old_pid" 2>/dev/null; then
+    die "ivan cannot signal MainPID ${old_pid} (process not owned by ivan?)"
+  fi
+  echo "unprivileged restart: SIGTERM MainPID=${old_pid} (systemd Restart=always will respawn)"
+  if [[ "$DRY_RUN" -eq 1 ]]; then
+    echo "DRY-RUN: kill -TERM ${old_pid}"
+    return 0
+  fi
+  kill -TERM "$old_pid" || die "kill -TERM ${old_pid} failed"
+  local deadline=$(( $(date +%s) + RESPAWN_TIMEOUT_SECONDS ))
+  while [[ $(date +%s) -lt $deadline ]]; do
+    sleep 1
+    local new_pid
+    new_pid="$(systemctl show "$SYSTEMD_UNIT" -p MainPID --value || echo 0)"
+    if [[ "$new_pid" -gt 1 && "$new_pid" != "$old_pid" ]]; then
+      # Confirm new pid is actually running.
+      if kill -0 "$new_pid" 2>/dev/null; then
+        echo "respawned: ${old_pid} -> ${new_pid}"
+        return 0
+      fi
+    fi
+  done
+  die "paperclip did not respawn within ${RESPAWN_TIMEOUT_SECONDS}s after SIGTERM ${old_pid}"
+}
+
 rollback() {
   echo "=== ROLLBACK: restoring ${CURRENT_HEAD:-UNKNOWN} ==="
   if [[ -n "${CURRENT_HEAD:-}" ]]; then
@@ -78,7 +109,7 @@ rollback() {
   echo "code restored on disk. DB dump at ${PRE_DUMP:-N/A}."
   echo "If migrate ran before failure, restore DB manually:"
   echo "  gunzip -c '${PRE_DUMP:-N/A}' | psql '${DATABASE_URL}'"
-  sudo -n systemctl restart paperclip 2>&1 || echo "manual restart required: sudo systemctl restart paperclip"
+  restart_paperclip_noroot 2>&1 || echo "manual recovery required (see RUNBOOK rollback section)"
 }
 
 # ---- resolve target (tag vs ref) ------------------------------------------
@@ -105,7 +136,6 @@ elif [[ -n "$TARGET_REF" ]]; then
   fi
   echo "=== deploy-paperclip.sh start ${TS} ref=${TARGET_REF} TAG=NONE (operator-escape) dry-run=${DRY_RUN} ==="
 else
-  # Default: latest stable tag on upstream.
   TARGET_TAG="$(git tag -l 'v*' | grep -E "${STABLE_TAG_PATTERN#^}" | grep -vE '^$' | sort -V | tail -1 || true)"
   [[ -n "$TARGET_TAG" ]] || die "no stable tag found in repo. Pass --tag explicitly."
   TARGET_REF="$TARGET_TAG"
@@ -171,9 +201,10 @@ if ! run "cd '${REPO_DIR}' && DATABASE_URL='${DATABASE_URL}' pnpm db:migrate"; t
   echo "migrate FAILED — rolling back"; rollback; exit 1
 fi
 
-# ---- phase 7: restart ------------------------------------------------------
-run "sudo -n systemctl restart paperclip" \
-  || die "systemctl restart failed (sudo NOPASSWD required for ivan → systemctl restart paperclip)"
+# ---- phase 7: restart (UNPRIVILEGED) ---------------------------------------
+if ! restart_paperclip_noroot; then
+  echo "restart FAILED — rolling back"; rollback; exit 1
+fi
 
 # ---- phase 8: health check -------------------------------------------------
 echo "waiting for /api/health (max ${HEALTH_TIMEOUT_SECONDS}s)..."
