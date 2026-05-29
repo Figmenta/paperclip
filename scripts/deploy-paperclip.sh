@@ -80,7 +80,7 @@ echo "target:  ${TARGET_REF} @ ${TARGET_SHA}"
 
 if [[ "$CURRENT_HEAD" == "$TARGET_SHA" ]]; then
   echo "already at target; nothing to deploy. running invariant probe only."
-  run "DATABASE_URL='${DATABASE_URL}' tsx ${REPO_DIR}/scripts/probe-binding-invariant.ts" \
+  run "DATABASE_URL='${DATABASE_URL}' tsx ${REPO_DIR}/server/scripts/probe-binding-invariant.ts" \
     || die "binding invariant probe FAILED on no-op deploy — bindings drifted from runtime config"
   echo "=== no-op deploy OK ==="
   exit 0
@@ -147,10 +147,10 @@ fi
 echo "health OK"
 
 # ---- phase 9: F3 reconcile + invariant probe -------------------------------
-if ! run "cd '${REPO_DIR}' && DATABASE_URL='${DATABASE_URL}' tsx scripts/reconcile-bindings.ts --apply --label 'deploy-${TS}'"; then
+if ! run "cd '${REPO_DIR}' && DATABASE_URL='${DATABASE_URL}' tsx server/scripts/reconcile-bindings.ts --apply --label 'deploy-${TS}'"; then
   echo "reconcile FAILED — rolling back"; rollback; exit 1
 fi
-if ! run "cd '${REPO_DIR}' && DATABASE_URL='${DATABASE_URL}' tsx scripts/probe-binding-invariant.ts"; then
+if ! run "cd '${REPO_DIR}' && DATABASE_URL='${DATABASE_URL}' tsx server/scripts/probe-binding-invariant.ts"; then
   echo "binding invariant FAILED — rolling back"; rollback; exit 1
 fi
 

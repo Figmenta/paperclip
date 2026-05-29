@@ -61,7 +61,7 @@ async function main() {
       if (!isSecretRef(raw)) continue;
       candidateRefs += 1;
       const ref = raw;
-      const configPath = `adapter_config.env.${key}`;
+      const configPath = `env.${key}`;
 
       // Validate the secret exists in the same company.
       const secretRow = await db
