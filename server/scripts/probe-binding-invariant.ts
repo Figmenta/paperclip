@@ -3,10 +3,12 @@
 // SQL-only check that catches the entire binding_missing class without a live
 // secret resolution. For every agents.adapter_config.env.{KEY} of shape
 // { type:'secret_ref', secretId }, asserts that a matching company_secret_bindings
-// row exists. Fails loud with non-zero exit + a report of every gap.
+// row exists with config_path 'env.{KEY}' (the format the runtime injection
+// path uses — verified against figos-backfill-2026-05-29 and the upstream
+// secrets-service tests). Fails loud with non-zero exit + a report of every gap.
 //
 // Usage:
-//   DATABASE_URL=... tsx scripts/probe-binding-invariant.ts
+//   DATABASE_URL=... tsx server/scripts/probe-binding-invariant.ts
 //
 // Exit 0 = all bindings present. Exit 1 = at least one missing.
 
@@ -17,7 +19,7 @@ const QUERY = sql`
 WITH ref AS (
   SELECT a.id::text AS agent_id, a.company_id::text AS company_id, kv.key AS env_key,
          (kv.value->>'secretId')::uuid AS secret_id,
-         'adapter_config.env.' || kv.key AS config_path
+         ('env.' || kv.key) AS config_path
   FROM agents a,
        LATERAL jsonb_each(COALESCE(a.adapter_config->'env', '{}'::jsonb)) AS kv(key, value)
   WHERE jsonb_typeof(kv.value) = 'object'
