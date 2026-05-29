@@ -2,11 +2,23 @@
 # Paperclip atomic deploy — FIG-763 F1.
 # Only sanctioned way to change running prod code on VPS-3 DBAGENTS.
 #
-# Usage:
-#   ./deploy-paperclip.sh [--ref <git-ref>] [--dry-run] [--skip-stage-confirm]
+# Fork-tracking policy (Federico 2026-05-29 via FIG-763): align ONLY to upstream
+# STABLE tags (vYYYY.MMDD.0). Never to upstream/master, never to canary tags.
+# Local fork patches rebase onto each new stable base; conflicts surface in F2
+# staging before prod ever sees them.
 #
-# Default ref is origin/master. With --dry-run, prints the plan without touching prod.
-# Requires: ivan has NOPASSWD on `systemctl restart paperclip` (configured by Federico).
+# Usage:
+#   ./deploy-paperclip.sh --tag vYYYY.MMDD.0 [--dry-run]
+#   ./deploy-paperclip.sh --ref <sha-or-branch> --allow-non-tag [--dry-run]
+#
+# --tag is the canonical surface. --ref + --allow-non-tag is the operator escape
+# hatch for emergencies (e.g. hot-fix on a local branch) — every non-tag deploy
+# is logged with a TAG=NONE banner so audit can find it.
+#
+# Requires: ivan has NOPASSWD on `systemctl restart paperclip` (configured by
+# Federico). The systemd unit /etc/systemd/system/paperclip.service is the
+# existing supervisor (shipped under FIG-443 on 2026-05-19, currently active+
+# enabled with Restart=always).
 
 set -euo pipefail
 
@@ -15,19 +27,27 @@ REPO_DIR="/home/ivan/dev/paperclip"
 STATE_DIR="/home/ivan/.paperclip-deploy-state"
 BACKUP_DIR="/home/ivan/.paperclip/instances/default/data/backups"
 LOG_FILE="${STATE_DIR}/deploy.log"
-DATABASE_URL="${DATABASE_URL:-postgres://paperclip:paperclip@127.0.0.1:54329/postgres}"
+DATABASE_URL="${DATABASE_URL:-postgres://paperclip:paperclip@127.0.0.1:54329/paperclip}"
 HEALTH_URL="http://127.0.0.1:3100/api/health"
 HEALTH_TIMEOUT_SECONDS=60
-TARGET_REF="origin/master"
+TARGET_REF=""
+TARGET_TAG=""
+ALLOW_NON_TAG=0
 DRY_RUN=0
 SKIP_STAGE_CONFIRM=0
 CURRENT_HEAD=""
 PRE_DUMP=""
 
+# Stable-tag pattern: vYYYY.MMDD.N where N is a non-negative integer.
+# Rejects: -canary, -beta, -rc, -anything-with-suffix.
+STABLE_TAG_PATTERN='^v[0-9]{4}\.[0-9]{1,3}\.[0-9]+$'
+
 # ---- args ------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --tag) TARGET_TAG="$2"; shift 2 ;;
     --ref) TARGET_REF="$2"; shift 2 ;;
+    --allow-non-tag) ALLOW_NON_TAG=1; shift ;;
     --dry-run) DRY_RUN=1; shift ;;
     --skip-stage-confirm) SKIP_STAGE_CONFIRM=1; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -37,7 +57,6 @@ done
 mkdir -p "$STATE_DIR"
 TS="$(date -u +%Y%m%dT%H%M%SZ)"
 exec > >(tee -a "$LOG_FILE") 2>&1
-echo "=== deploy-paperclip.sh start ${TS} target=${TARGET_REF} dry-run=${DRY_RUN} ==="
 
 # ---- helpers (defined before use) ------------------------------------------
 run() {
@@ -62,15 +81,44 @@ rollback() {
   sudo -n systemctl restart paperclip 2>&1 || echo "manual restart required: sudo systemctl restart paperclip"
 }
 
-# ---- phase 1: pre-flight ---------------------------------------------------
+# ---- resolve target (tag vs ref) ------------------------------------------
 cd "$REPO_DIR"
+git fetch --quiet origin
+git fetch --quiet upstream --tags 2>&1 || echo "WARN: upstream fetch failed (continuing with cached tags)"
+
+if [[ -n "$TARGET_TAG" && -n "$TARGET_REF" ]]; then
+  die "--tag and --ref are mutually exclusive"
+fi
+
+if [[ -n "$TARGET_TAG" ]]; then
+  if ! [[ "$TARGET_TAG" =~ $STABLE_TAG_PATTERN ]]; then
+    die "tag '${TARGET_TAG}' does not match stable pattern ${STABLE_TAG_PATTERN} — canary/beta/rc tags are not deployable per fork-tracking policy"
+  fi
+  if ! git rev-parse --verify "${TARGET_TAG}^{commit}" >/dev/null 2>&1; then
+    die "tag '${TARGET_TAG}' not present in repo. Did you fetch upstream --tags?"
+  fi
+  TARGET_REF="$TARGET_TAG"
+  echo "=== deploy-paperclip.sh start ${TS} tag=${TARGET_TAG} dry-run=${DRY_RUN} ==="
+elif [[ -n "$TARGET_REF" ]]; then
+  if [[ "$ALLOW_NON_TAG" -ne 1 ]]; then
+    die "--ref requires --allow-non-tag (fork-tracking policy: only stable tags by default). Refusing ref '${TARGET_REF}'."
+  fi
+  echo "=== deploy-paperclip.sh start ${TS} ref=${TARGET_REF} TAG=NONE (operator-escape) dry-run=${DRY_RUN} ==="
+else
+  # Default: latest stable tag on upstream.
+  TARGET_TAG="$(git tag -l 'v*' | grep -E "${STABLE_TAG_PATTERN#^}" | grep -vE '^$' | sort -V | tail -1 || true)"
+  [[ -n "$TARGET_TAG" ]] || die "no stable tag found in repo. Pass --tag explicitly."
+  TARGET_REF="$TARGET_TAG"
+  echo "=== deploy-paperclip.sh start ${TS} tag=${TARGET_TAG} (auto-detected latest stable) dry-run=${DRY_RUN} ==="
+fi
+
+# ---- phase 1: pre-flight ---------------------------------------------------
 [[ -d .git ]] || die "not a git checkout: $REPO_DIR"
 
 if [[ -n "$(git status --porcelain)" ]]; then
   die "working tree dirty — refuse to deploy. Inspect: git status"
 fi
 
-git fetch --quiet origin
 CURRENT_HEAD="$(git rev-parse HEAD)"
 CURRENT_BRANCH="$(git symbolic-ref --short HEAD 2>/dev/null || echo DETACHED)"
 TARGET_SHA="$(git rev-parse "$TARGET_REF")"
@@ -79,8 +127,8 @@ echo "current: ${CURRENT_BRANCH} @ ${CURRENT_HEAD}"
 echo "target:  ${TARGET_REF} @ ${TARGET_SHA}"
 
 if [[ "$CURRENT_HEAD" == "$TARGET_SHA" ]]; then
-  echo "already at target; nothing to deploy. running invariant probe only."
-  run "DATABASE_URL='${DATABASE_URL}' tsx ${REPO_DIR}/server/scripts/probe-binding-invariant.ts" \
+  echo "already at target; running invariant probe only."
+  run "DATABASE_URL='${DATABASE_URL}' /home/ivan/dev/paperclip/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/cli.mjs ${REPO_DIR}/server/scripts/probe-binding-invariant.ts" \
     || die "binding invariant probe FAILED on no-op deploy — bindings drifted from runtime config"
   echo "=== no-op deploy OK ==="
   exit 0
@@ -93,10 +141,6 @@ run "echo '${CURRENT_BRANCH}' >> '${PREV_REF_FILE}'"
 echo "previous ref recorded at ${PREV_REF_FILE}"
 
 # ---- phase 3: pre-migrate dump --------------------------------------------
-# Reuse the most recent in-process backup if <5 min old. Otherwise refuse —
-# operator must POST /api/instance/database-backups (instance-admin auth) or wait
-# for the next scheduled cycle. Refusal is intentional — no rollback baseline,
-# no deploy.
 PRE_DUMP="${STATE_DIR}/pre-deploy-${TS}.sql.gz"
 LATEST_BACKUP="$(ls -t ${BACKUP_DIR}/paperclip-*.sql.gz 2>/dev/null | head -1 || true)"
 if [[ -n "$LATEST_BACKUP" ]]; then
@@ -147,10 +191,11 @@ fi
 echo "health OK"
 
 # ---- phase 9: F3 reconcile + invariant probe -------------------------------
-if ! run "cd '${REPO_DIR}' && DATABASE_URL='${DATABASE_URL}' tsx server/scripts/reconcile-bindings.ts --apply --label 'deploy-${TS}'"; then
+TSX_BIN="/home/ivan/dev/paperclip/node_modules/.pnpm/tsx@4.21.0/node_modules/tsx/dist/cli.mjs"
+if ! run "cd '${REPO_DIR}' && DATABASE_URL='${DATABASE_URL}' '${TSX_BIN}' server/scripts/reconcile-bindings.ts --apply --label 'deploy-${TS}'"; then
   echo "reconcile FAILED — rolling back"; rollback; exit 1
 fi
-if ! run "cd '${REPO_DIR}' && DATABASE_URL='${DATABASE_URL}' tsx server/scripts/probe-binding-invariant.ts"; then
+if ! run "cd '${REPO_DIR}' && DATABASE_URL='${DATABASE_URL}' '${TSX_BIN}' server/scripts/probe-binding-invariant.ts"; then
   echo "binding invariant FAILED — rolling back"; rollback; exit 1
 fi
 
@@ -159,6 +204,7 @@ NEW_HEAD="$(git rev-parse HEAD)"
 NEW_BRANCH="$(git symbolic-ref --short HEAD 2>/dev/null || echo DETACHED)"
 run "echo '${NEW_HEAD}' > '${STATE_DIR}/current-pinned-ref.txt'"
 run "echo '${NEW_BRANCH}' >> '${STATE_DIR}/current-pinned-ref.txt'"
+run "echo 'tag=${TARGET_TAG:-NONE}' >> '${STATE_DIR}/current-pinned-ref.txt'"
 
-echo "=== deploy OK: ${CURRENT_HEAD} -> ${NEW_HEAD} ref=${NEW_BRANCH} ==="
+echo "=== deploy OK: ${CURRENT_HEAD} -> ${NEW_HEAD} tag=${TARGET_TAG:-NONE} ==="
 exit 0
