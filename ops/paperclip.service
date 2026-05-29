@@ -1,0 +1,75 @@
+# Paperclip control plane systemd unit — Figmenta fork, VPS-3 DBAGENTS
+# Reference copy under version control (FIG-763 / FIG-443).
+#
+# Install target: /etc/systemd/system/paperclip.service (root:root 644)
+# Install procedure: ops/bootstrap-systemd.sh (run by Federico as root, once
+# per host).
+#
+# Design notes for this unit (auditable divergence from the FIG-763 brief):
+#
+# - User=ivan: required so the no-root deploy flow (deploy-paperclip.sh,
+#   restart_paperclip_noroot) can SIGTERM the MainPID without sudo. Changing
+#   this to User=root would break the no-root invariant Federico set on
+#   2026-05-29T19:21Z. If a future host needs a different svc user, deploy.sh
+#   must be updated in lockstep (it asserts kill -0 ownership before TERM).
+#
+# - Restart=always (NOT Restart=on-failure as the FIG-763 brief suggested):
+#   the no-root restart path SIGTERMs the MainPID, which is a clean exit
+#   (status 0). on-failure would NOT respawn a clean exit → deploy.sh phase 7
+#   would hang on the respawn poll → automatic rollback. always is required
+#   for SIGTERM + auto-respawn to work. RestartSec=5 keeps the gap short but
+#   non-zero so back-to-back crashes don't busy-loop.
+#
+# - KillMode is implicit control-group (systemd default). Required: when
+#   systemd respawns the unit, it must kill the whole cgroup including the
+#   embedded postgres child (PID 2120720 today), otherwise the new postgres
+#   collides on the datadir lock at :54329.
+#
+# - TimeoutStopSec=30: tsx-on-SIGTERM should exit in ~1-5s under normal load.
+#   30s gives a generous margin without making rollback feel slow.
+#
+# - StandardOutput/Error=append:/home/ivan/paperclip-prod.log: keeps the
+#   long-running log under ivan's home for easy tail-f without journalctl
+#   privileges. Rotation expected to be operator-managed (logrotate or
+#   periodic truncate).
+#
+# - LimitNOFILE=65536: paperclip opens many file handles via embedded
+#   postgres + heartbeat fan-out; default 1024 is insufficient under load.
+#
+# - OOMScoreAdjust=-500: prefer killing other userspace before the control
+#   plane on memory pressure. VPS-3 also hosts ~6 cloudflared tunnels +
+#   vps3-mcp-server; this biases OOM-killer correctly.
+#
+# - EnvironmentFile=/etc/paperclip/paperclip-prod.env (root:root 600):
+#   holds PAPERCLIP_AGENT_JWT_SECRET and BETTER_AUTH_SECRET extracted from
+#   the previous start script under FIG-443 on 2026-05-19. Operator must
+#   create this file out of band before first start.
+#
+# History:
+# - 2026-05-19 FIG-443: shipped to /etc/systemd/system/paperclip.service on
+#   VPS-3 after the disk-full / no-supervisor incident.
+# - 2026-05-29 FIG-763: ref-copied into the repo for audit and portable
+#   bootstrap (e.g. v2026.529.0 alignment on a new host).
+
+[Unit]
+Description=Paperclip control plane (Figmenta fleet) - VPS-3
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ivan
+Group=ivan
+WorkingDirectory=/home/ivan/dev/paperclip/server
+EnvironmentFile=/etc/paperclip/paperclip-prod.env
+ExecStart=/bin/bash /home/ivan/start-paperclip-prod.sh
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+LimitNOFILE=65536
+OOMScoreAdjust=-500
+StandardOutput=append:/home/ivan/paperclip-prod.log
+StandardError=append:/home/ivan/paperclip-prod.log
+
+[Install]
+WantedBy=multi-user.target
