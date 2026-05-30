@@ -40,6 +40,12 @@ PRE_DUMP=""
 # FIG-772 fix #1: track whether phase 5 ran pnpm install, so rollback() can
 # restore dependencies to match the rolled-back lockfile before restart.
 INSTALL_RAN=0
+# FIG-772 fix #1 (FIGOS addendum): track whether phase 6 entered `pnpm db:migrate`,
+# so rollback() restores the pre-migrate DB dump before restart. Set BEFORE the
+# migrate call (not after success) because a partially-applied migrate also dirties
+# the DB and must be unwound. Without this, a rolled-back code path runs against a
+# new schema — the exact 3am scenario FIG-763 exists to prevent.
+MIGRATE_RAN=0
 
 # Stable-tag pattern: vYYYY.MMDD.N. Rejects -canary, -beta, -rc, any suffix.
 STABLE_TAG_PATTERN='^v[0-9]{4}\.[0-9]{1,3}\.[0-9]+$'
@@ -129,9 +135,40 @@ rollback() {
       exit 1
     fi
   fi
-  echo "code restored on disk. DB dump at ${PRE_DUMP:-N/A}."
-  echo "If migrate ran before failure, restore DB manually:"
-  echo "  gunzip -c '${PRE_DUMP:-N/A}' | psql '${DATABASE_URL}'"
+  # FIG-772 fix #1 (FIGOS addendum): if phase 6 entered `pnpm db:migrate`, the DB
+  # may have been mutated (fully or partially) and now mismatches the rolled-back
+  # code. Restore the pre-migrate dump BEFORE restart. If the restore fails, do
+  # NOT restart with schema/code mismatch — escalate to manual recovery.
+  if [[ "$MIGRATE_RAN" -eq 1 ]]; then
+    if [[ -z "${PRE_DUMP:-}" ]] || [[ ! -r "${PRE_DUMP}" ]]; then
+      echo "FATAL: rollback DB restore impossible — PRE_DUMP missing or unreadable: '${PRE_DUMP:-N/A}'"
+      echo "Manual recovery: locate latest dump in ${BACKUP_DIR} and apply"
+      echo "  gunzip -c <backup>.sql.gz | psql '${DATABASE_URL}'"
+      exit 1
+    fi
+    if ! command -v psql >/dev/null 2>&1; then
+      echo "FATAL: rollback DB restore impossible — psql not on PATH"
+      echo "Install postgresql-client on this host before retrying deploy."
+      exit 1
+    fi
+    echo "rollback: restoring DB from pre-migrate dump (${PRE_DUMP})"
+    # PGOPTIONS lock_timeout=30s: fail fast on concurrent locks rather than
+    # blocking the rollback indefinitely on a held lock.
+    # ON_ERROR_STOP=1: abort the restore on the first SQL error — the dump is a
+    # single BEGIN/COMMIT transaction, so a partial restore is impossible, but
+    # this also protects against unexpected post-COMMIT psql statements.
+    if ! gunzip -c "${PRE_DUMP}" | PGOPTIONS='-c lock_timeout=30000' psql "${DATABASE_URL}" -v ON_ERROR_STOP=1; then
+      echo "FATAL: rollback DB restore failed — refusing to restart with schema/code mismatch"
+      echo "Manual recovery required:"
+      echo "  cd ${REPO_DIR}"
+      echo "  git status   # verify HEAD = ${CURRENT_HEAD}"
+      echo "  PGOPTIONS='-c lock_timeout=30000' gunzip -c '${PRE_DUMP}' | psql '${DATABASE_URL}' -v ON_ERROR_STOP=1"
+      echo "  systemctl show ${SYSTEMD_UNIT} -p MainPID --value  # then kill -TERM <pid>"
+      exit 1
+    fi
+    echo "rollback: DB restored from ${PRE_DUMP}"
+  fi
+  echo "code + DB restored on disk."
   restart_paperclip_noroot 2>&1 || echo "manual recovery required (see RUNBOOK rollback section)"
 }
 
@@ -229,6 +266,12 @@ else
 fi
 
 # ---- phase 6: migrate ------------------------------------------------------
+# FIG-772 fix #1 (FIGOS addendum): mark MIGRATE_RAN BEFORE the migrate call so
+# rollback() restores the DB even if migrate fails partway through (DB already
+# dirty). Symmetric to INSTALL_RAN, with opposite timing: install is set AFTER
+# success (deps don't mutate on a failed install); migrate is set BEFORE the
+# call (DB can mutate on a failed migrate).
+MIGRATE_RAN=1
 if ! run "cd '${REPO_DIR}' && DATABASE_URL='${DATABASE_URL}' pnpm db:migrate"; then
   echo "migrate FAILED — rolling back"; rollback; exit 1
 fi
