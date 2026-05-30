@@ -37,9 +37,15 @@ DRY_RUN=0
 SKIP_STAGE_CONFIRM=0
 CURRENT_HEAD=""
 PRE_DUMP=""
+# FIG-772 fix #1: track whether phase 5 ran pnpm install, so rollback() can
+# restore dependencies to match the rolled-back lockfile before restart.
+INSTALL_RAN=0
 
 # Stable-tag pattern: vYYYY.MMDD.N. Rejects -canary, -beta, -rc, any suffix.
 STABLE_TAG_PATTERN='^v[0-9]{4}\.[0-9]{1,3}\.[0-9]+$'
+# FIG-772 fix #3: safe-ref pattern for --ref + --allow-non-tag operator escape.
+# Closes the only operator-controlled string that flows into `run "..."` (eval).
+SAFE_REF_PATTERN='^[A-Za-z0-9._/-]+$'
 
 # ---- args ------------------------------------------------------------------
 while [[ $# -gt 0 ]]; do
@@ -106,6 +112,23 @@ rollback() {
   if [[ -n "${CURRENT_HEAD:-}" ]]; then
     git checkout "$CURRENT_HEAD" 2>&1 || true
   fi
+  # FIG-772 fix #1: if phase 5 ran `pnpm install`, the new node_modules now
+  # mismatch the rolled-back lockfile. Restore deps with --frozen-lockfile
+  # against the restored tree BEFORE restart. If this second install fails,
+  # do NOT restart with mismatched deps — escalate to manual recovery.
+  if [[ "$INSTALL_RAN" -eq 1 ]]; then
+    echo "rollback: re-installing deps against restored lockfile (frozen)"
+    if ! pnpm install --frozen-lockfile; then
+      echo "FATAL: rollback pnpm install failed — refusing to restart with mismatched deps"
+      echo "Manual recovery required:"
+      echo "  cd ${REPO_DIR}"
+      echo "  git status   # verify HEAD = ${CURRENT_HEAD}"
+      echo "  pnpm install --frozen-lockfile"
+      echo "  systemctl show ${SYSTEMD_UNIT} -p MainPID --value  # then kill -TERM <pid>"
+      echo "  DB dump (if migrate ran): gunzip -c '${PRE_DUMP:-N/A}' | psql '${DATABASE_URL}'"
+      exit 1
+    fi
+  fi
   echo "code restored on disk. DB dump at ${PRE_DUMP:-N/A}."
   echo "If migrate ran before failure, restore DB manually:"
   echo "  gunzip -c '${PRE_DUMP:-N/A}' | psql '${DATABASE_URL}'"
@@ -133,6 +156,12 @@ if [[ -n "$TARGET_TAG" ]]; then
 elif [[ -n "$TARGET_REF" ]]; then
   if [[ "$ALLOW_NON_TAG" -ne 1 ]]; then
     die "--ref requires --allow-non-tag (fork-tracking policy: only stable tags by default). Refusing ref '${TARGET_REF}'."
+  fi
+  # FIG-772 fix #3: validate operator-supplied ref BEFORE it is interpolated
+  # into any `run "..."` call (which `eval`s its argument). Closes the only
+  # operator-input path into the shell-feature-using eval helper.
+  if ! [[ "$TARGET_REF" =~ $SAFE_REF_PATTERN ]]; then
+    die "ref '${TARGET_REF}' contains characters outside safe pattern ${SAFE_REF_PATTERN} — refusing to interpolate into shell"
   fi
   echo "=== deploy-paperclip.sh start ${TS} ref=${TARGET_REF} TAG=NONE (operator-escape) dry-run=${DRY_RUN} ==="
 else
@@ -194,6 +223,9 @@ if git diff --quiet "${CURRENT_HEAD}" "${TARGET_SHA}" -- pnpm-lock.yaml; then
   echo "pnpm-lock.yaml unchanged — skipping install"
 else
   run "pnpm install --frozen-lockfile"
+  # FIG-772 fix #1: mark INSTALL_RAN so rollback() restores deps after a
+  # later-phase failure on a lockfile-changing deploy.
+  INSTALL_RAN=1
 fi
 
 # ---- phase 6: migrate ------------------------------------------------------

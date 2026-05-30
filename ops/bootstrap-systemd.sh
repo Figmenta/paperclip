@@ -89,11 +89,18 @@ fi
 systemctl enable paperclip
 echo "paperclip enabled (start on boot)"
 
-# Migrate legacy nohup process if present. Look for tsx src/index.ts OUTSIDE
-# the systemd cgroup. (Inside the cgroup is the unit's own process — leave it.)
+# Migrate legacy nohup process if present. Look for tsx src/index.ts that
+# (a) has cwd under our REPO_DIR, AND (b) is OUTSIDE the systemd paperclip
+# cgroup. Both conditions required:
+#   - cwd filter (FIG-772 fix #2) excludes unrelated foreign `tsx src/index.ts`
+#     processes on the host (e.g. an unrelated tsx app, another agent's
+#     paperclip checkout). A legitimate legacy nohup-tsx Paperclip process
+#     always has cwd under /home/ivan/dev/paperclip.
+#   - cgroup filter excludes the unit's own process (already systemd-managed).
 LEGACY_PIDS="$(pgrep -f 'tsx.*src/index.ts' | while read -r pid; do
+  cwd="$(readlink /proc/$pid/cwd 2>/dev/null || true)"
   cg="$(cat /proc/$pid/cgroup 2>/dev/null || true)"
-  if [[ "$cg" != *"system.slice/paperclip.service"* ]]; then
+  if [[ "$cwd" == "$REPO_DIR"* ]] && [[ "$cg" != *"system.slice/paperclip.service"* ]]; then
     echo "$pid"
   fi
 done)"
