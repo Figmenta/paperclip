@@ -683,13 +683,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       {
         resumeSessionId,
         skipGitRepoCheck: executionTargetIsSandbox,
+        billingType,
       },
     );
     const args = execArgs.args;
+    const extraNotes = [execArgs.modelSwappedReason, execArgs.fastModeIgnoredReason].filter(
+      (value): value is string => value != null,
+    );
     const commandNotesWithFastMode =
-      execArgs.fastModeIgnoredReason == null
-        ? commandNotes
-        : [...commandNotes, execArgs.fastModeIgnoredReason];
+      extraNotes.length === 0 ? commandNotes : [...commandNotes, ...extraNotes];
     if (onMeta) {
       await onMeta({
         adapterType: "codex_local",
