@@ -1063,10 +1063,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (
       sessionId &&
       !initial.proc.timedOut &&
-      (initial.proc.exitCode ?? 0) !== 0 &&
       initial.parsed &&
       isClaudeThinkingBlockReplayError(initial.parsed)
     ) {
+      // The replay 400 can surface with the CLI still reporting exit 0 /
+      // subtype=success (the API error is embedded in the result payload
+      // rather than a non-zero exit code), so this recovery must not gate on
+      // exitCode — match purely on the deterministic thinking-block signature.
       await onLog(
         "stdout",
         `[paperclip] Claude session "${sessionId}" has corrupted thinking blocks; starting a fresh session.\n`,
