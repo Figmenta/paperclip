@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   extractClaudeRetryNotBefore,
+  isClaudeThinkingBlockReplayError,
   isClaudeTransientUpstreamError,
 } from "./parse.js";
 
@@ -92,6 +93,42 @@ describe("isClaudeTransientUpstreamError", () => {
       isClaudeTransientUpstreamError({
         errorMessage: "Invalid request_error: Unknown parameter 'foo'.",
       }),
+    ).toBe(false);
+  });
+});
+
+describe("isClaudeThinkingBlockReplayError", () => {
+  it("matches the verbatim Anthropic 400 wording even when subtype=success", () => {
+    expect(
+      isClaudeThinkingBlockReplayError({
+        subtype: "success",
+        result:
+          "API Error: 400 messages.1.content.1: `thinking` or `redacted_thinking` blocks in the latest assistant message cannot be modified. These blocks must remain as they were in the original response.",
+      }),
+    ).toBe(true);
+  });
+
+  it("matches when the error is carried in the structured errors array", () => {
+    expect(
+      isClaudeThinkingBlockReplayError({
+        is_error: true,
+        errors: [
+          {
+            type: "invalid_request_error",
+            message:
+              "messages.1.content.10: thinking or redacted_thinking blocks in the latest assistant message cannot be modified.",
+          },
+        ],
+      }),
+    ).toBe(true);
+  });
+
+  it("does not match unrelated failures", () => {
+    expect(
+      isClaudeThinkingBlockReplayError({ result: "No conversation found with session id abc-123" }),
+    ).toBe(false);
+    expect(
+      isClaudeThinkingBlockReplayError({ result: "Overloaded. Try again later." }),
     ).toBe(false);
   });
 });
