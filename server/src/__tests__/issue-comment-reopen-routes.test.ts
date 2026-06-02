@@ -513,6 +513,65 @@ describe.sequential("issue comment reopen routes", () => {
     ));
   });
 
+  it("does not implicitly reopen closed issues for board-API-key (machine) comments", async () => {
+    // FIG-810: a board API key resolves to actorType "user" via getActorInfo,
+    // but it is a machine caller (status tooling, heartbeat-close, CI). A
+    // freeform comment it posts after a done close must NOT reopen the issue.
+    mockIssueService.getById.mockResolvedValue(makeIssue("done"));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue("done"),
+      ...patch,
+    }));
+
+    const res = await request(await installActor(createApp(), {
+      type: "board",
+      userId: "board-key-user",
+      companyIds: ["company-1"],
+      source: "board_key",
+      keyId: "board-key-1",
+      isInstanceAdmin: false,
+    }))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "[PROGRESS] heartbeat close note" });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).not.toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({ status: "todo" }),
+    );
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({ reason: "issue_reopened_via_comment" }),
+    );
+  });
+
+  it("still explicitly reopens closed issues for board-API-key comments with reopen=true", async () => {
+    // The machine-actor exemption is for the IMPLICIT path only; an explicit
+    // reopen flag must still work. (FIG-810)
+    mockIssueService.getById.mockResolvedValue(makeIssue("done"));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue("done"),
+      ...patch,
+    }));
+
+    const res = await request(await installActor(createApp(), {
+      type: "board",
+      userId: "board-key-user",
+      companyIds: ["company-1"],
+      source: "board_key",
+      keyId: "board-key-1",
+      isInstanceAdmin: false,
+    }))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "reopen please", reopen: true });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      { status: "todo" },
+    );
+  });
+
   it("rejects non-assignee agent POST comments on closed issues", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("done"));
     mockIssueService.addComment.mockResolvedValue({

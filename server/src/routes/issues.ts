@@ -618,10 +618,18 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   assigneeAgentId: string | null | undefined;
   actorType: "agent" | "user";
   actorId: string;
+  actorSource?: string | null;
 }) {
   // Only human comments should implicitly reopen finished work.
   // Agent-authored comments remain communicative unless reopen was explicit.
   if (input.actorType !== "user") return false;
+  // Board API-key actors (source "board_key") are machine callers — status
+  // tooling, heartbeat-close, CI — that resolve to actorType "user" via
+  // getActorInfo. A freeform comment they post after a done/cancelled close
+  // must NOT implicitly reopen the issue; machine callers reopen only via an
+  // explicit reopen/resume flag. Interactive humans (session / local_implicit /
+  // cloud_tenant) keep the implicit reopen. (FIG-810)
+  if (input.actorSource === "board_key") return false;
   if (!isClosedIssueStatus(input.issueStatus) && input.issueStatus !== "blocked") return false;
   if (typeof input.assigneeAgentId !== "string" || input.assigneeAgentId.length === 0) return false;
   return true;
@@ -3480,6 +3488,7 @@ export function issueRoutes(
           assigneeAgentId: requestedAssigneeAgentId,
           actorType: actor.actorType,
           actorId: actor.actorId,
+          actorSource: actor.actorSource,
         })) ||
       shouldResumeInProgressScheduledRetry;
     const updateReferenceSummaryBefore = titleOrDescriptionChanged
@@ -5148,6 +5157,7 @@ export function issueRoutes(
         assigneeAgentId: issue.assigneeAgentId,
         actorType: actor.actorType,
         actorId: actor.actorId,
+        actorSource: actor.actorSource,
       }) ||
       shouldResumeInProgressScheduledRetry;
     const hasUnresolvedFirstClassBlockers =
