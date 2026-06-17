@@ -2972,6 +2972,49 @@ export function agentRoutes(
     });
   });
 
+  // Orchestra wake-receive endpoint (FIG-1164). Orchestra is Figmenta's task
+  // source of truth; on assignment it fires a TARGETED, best-effort wake so the
+  // agent PULLS its work from Orchestra's inbox ("only the trigger is push").
+  // See orchestra/app/paperclip_wake.py. Orchestra POSTs a board-authenticated
+  // request with a flat dialect — { reason, source: "orchestra", task_id,
+  // agent_id } — which we normalize onto the canonical wakeup path as an
+  // `automation` wake. The wake carries the Orchestra task_id (not a Paperclip
+  // issueId — the work lives in Orchestra), so it is a pure "go pull" trigger.
+  // Duplicate wakes for the same task are tolerated: while the agent already has
+  // an active execution run, enqueueWakeup coalesces same-agent wakes into it,
+  // and the per-task idempotencyKey records the dedupe key for the audit trail.
+  // Expose this path to Orchestra via ORCHESTRA_PAPERCLIP_WAKE_PATH=
+  // /api/agents/{agent_id}/orchestra-wake.
+  router.post("/agents/:id/orchestra-wake", async (req, res) => {
+    const id = req.params.id as string;
+    const taskId = typeof req.body?.task_id === "string" ? req.body.task_id.trim() : "";
+    if (!taskId) {
+      res.status(400).json({ error: "task_id is required" });
+      return;
+    }
+    const bodyAgentId = typeof req.body?.agent_id === "string" ? req.body.agent_id.trim() : "";
+    if (bodyAgentId && bodyAgentId !== id) {
+      res.status(400).json({ error: "agent_id does not match the URL agent id" });
+      return;
+    }
+    const reason = typeof req.body?.reason === "string" && req.body.reason.trim()
+      ? req.body.reason.trim()
+      : "orchestra.task.assigned";
+    // Normalize Orchestra's dialect onto the shape handleWakeupRoute reads off
+    // the body, then delegate so auth (board / self-agent), skipped-response
+    // handling, and activity logging stay identical to /wakeup.
+    req.body = {
+      reason,
+      triggerDetail: "callback",
+      idempotencyKey: `orchestra:wake:${id}:${taskId}`,
+      payload: { source: "orchestra", orchestraTaskId: taskId },
+    };
+    await handleWakeupRoute(req, res, {
+      source: "automation",
+      skippedResponse: (agent) => buildSkippedWakeupResponse(agent, req.body.payload ?? null),
+    });
+  });
+
   router.post("/agents/:id/heartbeat/invoke", async (req, res) => {
     // Legacy endpoint. Hardcodes `source: "on_demand"` (the prior behavior
     // before the wakeup/invoke convergence). Reads scope fields directly off
