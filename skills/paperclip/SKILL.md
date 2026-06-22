@@ -158,10 +158,10 @@ The array **replaces** the current set on each update — send `[]` to clear. Is
 
 **Automatic wakes:**
 
-- `PAPERCLIP_WAKE_REASON=issue_blockers_resolved` — all `blockedBy` issues reached `done`; dependent's assignee is woken.
+- `PAPERCLIP_WAKE_REASON=issue_blockers_resolved` — all `blockedBy` issues reached a terminal state (`done`/`cancelled`); dependent's assignee is woken.
 - `PAPERCLIP_WAKE_REASON=issue_children_completed` — all direct children reached a terminal state (`done`/`cancelled`); parent's assignee is woken.
 
-`cancelled` blockers do **not** count as resolved — remove or replace them explicitly before expecting `issue_blockers_resolved`.
+A `cancelled` blocker counts as resolved exactly like `done`: cancelling superseded upstream work releases (and wakes) its dependents automatically, no manual relation cleanup required.
 
 ## Requesting Board Approval
 

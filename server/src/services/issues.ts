@@ -387,6 +387,17 @@ function createIssueDependencyReadiness(issueId: string): IssueDependencyReadine
   };
 }
 
+// A blocker stops counting against its dependents once it reaches a terminal
+// state. Both `done` and `cancelled` are terminal: cancelling a blocker means the
+// upstream work was dropped (e.g. superseded by a redesign), so the dependents
+// must be released exactly as if it had completed. Only non-terminal blockers
+// keep a dependent blocked. Keeping these two states in one predicate is the
+// single source of truth for "is this blocker resolved?". (FIG-1466)
+const RESOLVED_BLOCKER_STATUSES = ["done", "cancelled"] as const;
+function isResolvedBlockerStatus(status: string | null | undefined): boolean {
+  return status === "done" || status === "cancelled";
+}
+
 async function listIssueDependencyReadinessMap(
   dbOrTx: Pick<Db, "select">,
   companyId: string,
@@ -418,9 +429,9 @@ async function listIssueDependencyReadinessMap(
   for (const row of blockerRows) {
     const current = readinessMap.get(row.issueId) ?? createIssueDependencyReadiness(row.issueId);
     current.blockerIssueIds.push(row.blockerIssueId);
-    // Only done blockers resolve dependents; cancelled blockers stay unresolved
-    // until an operator removes or replaces the blocker relationship explicitly.
-    if (row.blockerStatus !== "done") {
+    // A terminal blocker (done OR cancelled) resolves its dependents; only
+    // non-terminal blockers keep a dependent blocked. (FIG-1466)
+    if (!isResolvedBlockerStatus(row.blockerStatus)) {
       current.unresolvedBlockerIssueIds.push(row.blockerIssueId);
       current.unresolvedBlockerCount += 1;
       current.allBlockersDone = false;
@@ -446,8 +457,9 @@ async function listUnresolvedBlockerIssueIds(
       and(
         eq(issues.companyId, companyId),
         inArray(issues.id, uniqueBlockerIssueIds),
-        // Cancelled blockers intentionally remain unresolved until the relation changes.
-        ne(issues.status, "done"),
+        // Terminal blockers (done OR cancelled) are resolved; only non-terminal
+        // blockers count as unresolved against their dependents. (FIG-1466)
+        notInArray(issues.status, [...RESOLVED_BLOCKER_STATUSES]),
       ),
     )
     .then((rows) => rows.map((row) => row.id));
@@ -3922,7 +3934,8 @@ export function issueService(db: Db) {
           return {
             ...candidate,
             blockerIssueIds: blockers.map((blocker) => blocker.blockerIssueId),
-            allBlockersDone: blockers.length > 0 && blockers.every((blocker) => blocker.blockerStatus === "done"),
+            // "all blockers resolved" — every blocker terminal (done OR cancelled). (FIG-1466)
+            allBlockersDone: blockers.length > 0 && blockers.every((blocker) => isResolvedBlockerStatus(blocker.blockerStatus)),
           };
         })
         .filter((candidate) => candidate.allBlockersDone)

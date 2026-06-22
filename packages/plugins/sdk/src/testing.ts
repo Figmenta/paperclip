@@ -1584,7 +1584,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         if (["backlog", "done", "cancelled"].includes(record.status)) {
           throw new Error(`Issue is not wakeable in status: ${record.status}`);
         }
-        const unresolved = issueRelationSummary(issueId).blockedBy.filter((blocker) => blocker.status !== "done");
+        // Terminal blockers (done OR cancelled) are resolved. (FIG-1466)
+        const unresolved = issueRelationSummary(issueId).blockedBy.filter(
+          (blocker) => blocker.status !== "done" && blocker.status !== "cancelled",
+        );
         if (unresolved.length > 0) throw new Error("Issue is blocked by unresolved blockers");
         return { queued: true, runId: randomUUID() };
       },
@@ -1598,7 +1601,10 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
           if (["backlog", "done", "cancelled"].includes(record.status)) {
             throw new Error(`Issue is not wakeable in status: ${record.status}`);
           }
-          const unresolved = issueRelationSummary(issueId).blockedBy.filter((blocker) => blocker.status !== "done");
+          // Terminal blockers (done OR cancelled) are resolved. (FIG-1466)
+          const unresolved = issueRelationSummary(issueId).blockedBy.filter(
+            (blocker) => blocker.status !== "done" && blocker.status !== "cancelled",
+          );
           if (unresolved.length > 0) throw new Error("Issue is blocked by unresolved blockers");
           results.push({ issueId, queued: true, runId: randomUUID() });
         }
