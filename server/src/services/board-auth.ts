@@ -9,6 +9,7 @@ import {
   companyMemberships,
   instanceUserRoles,
 } from "@paperclipai/db";
+import type { BoardApiKeyClass } from "@paperclipai/shared";
 import { conflict, forbidden, notFound } from "../errors.js";
 
 export const BOARD_API_KEY_TTL_MS = 180 * 24 * 60 * 60 * 1000;
@@ -164,8 +165,10 @@ export function boardAuthService(db: Db) {
     command: string;
     clientName?: string | null;
     requestedAccess: "board" | "instance_admin_required";
+    keyClass?: BoardApiKeyClass | null;
     requestedCompanyId?: string | null;
   }) {
+    const keyClass: BoardApiKeyClass = input.keyClass === "service" ? "service" : "human_cli";
     const challengeSecret = createCliAuthSecret();
     const pendingBoardToken = createBoardApiToken();
     const expiresAt = cliAuthChallengeExpiresAt();
@@ -182,6 +185,7 @@ export function boardAuthService(db: Db) {
         command: input.command.trim(),
         clientName: input.clientName?.trim() || null,
         requestedAccess: input.requestedAccess,
+        keyClass,
         requestedCompanyId: input.requestedCompanyId?.trim() || null,
         pendingKeyHash: hashBearerToken(pendingBoardToken),
         pendingKeyName,
@@ -239,6 +243,7 @@ export function boardAuthService(db: Db) {
       command: challenge.command,
       clientName: challenge.clientName ?? null,
       requestedAccess: challenge.requestedAccess as "board" | "instance_admin_required",
+      keyClass: (challenge.keyClass === "service" ? "service" : "human_cli") as BoardApiKeyClass,
       requestedCompanyId: challenge.requestedCompanyId ?? null,
       requestedCompanyName: company?.name ?? null,
       approvedAt: challenge.approvedAt?.toISOString() ?? null,
@@ -280,13 +285,19 @@ export function boardAuthService(db: Db) {
 
       let boardKeyId = challenge.boardApiKeyId;
       if (!boardKeyId) {
+        // SERVICE-class keys are non-expiring (expires_at NULL); HUMAN_CLI keys
+        // carry the board-key TTL. Validation (findBoardApiKeyByToken) already
+        // honors a NULL expires_at as "never expires". The human approval step
+        // above gates every mint regardless of class. See FIG-1673.
+        const isServiceKey = challenge.keyClass === "service";
         const createdKey = await tx
           .insert(boardApiKeys)
           .values({
             userId,
             name: challenge.pendingKeyName,
             keyHash: challenge.pendingKeyHash,
-            expiresAt: boardApiKeyExpiresAt(),
+            keyClass: isServiceKey ? "service" : "human_cli",
+            expiresAt: isServiceKey ? null : boardApiKeyExpiresAt(),
           })
           .returning()
           .then((rows) => rows[0]);
