@@ -2773,6 +2773,7 @@ export function accessRoutes(
             details: {
               boardApiKeyId: approved.challenge.boardApiKeyId,
               requestedAccess: approved.challenge.requestedAccess,
+              keyClass: approved.challenge.keyClass,
               requestedCompanyId: approved.challenge.requestedCompanyId,
               challengeId: approved.challenge.id,
             },

@@ -79,6 +79,7 @@ type CliAuthChallengeStatus = {
   command: string;
   clientName: string | null;
   requestedAccess: "board" | "instance_admin_required";
+  keyClass: "human_cli" | "service";
   requestedCompanyId: string | null;
   requestedCompanyName: string | null;
   approvedAt: string | null;

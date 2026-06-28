@@ -140,6 +140,12 @@ export function CliAuthPage() {
               {challenge.requestedAccess === "instance_admin_required" ? "Instance admin" : "Board"}
             </div>
           </div>
+          <div>
+            <div className="text-muted-foreground">Credential class</div>
+            <div className="text-foreground">
+              {challenge.keyClass === "service" ? "Service — never expires" : "Human CLI — expires per board-key policy"}
+            </div>
+          </div>
           {challenge.requestedCompanyName && (
             <div>
               <div className="text-muted-foreground">Requested company</div>
@@ -147,6 +153,17 @@ export function CliAuthPage() {
             </div>
           )}
         </div>
+
+        {challenge.keyClass === "service" && (
+          <p
+            role="alert"
+            className="mt-4 rounded-md border border-destructive/50 bg-destructive/10 p-3 text-sm text-destructive"
+          >
+            <strong>Non-expiring service credential.</strong> Approving this request mints a board API
+            key that <strong>never expires</strong> — it stays valid until you explicitly revoke it.
+            Only approve if you intend to issue a long-lived service key.
+          </p>
+        )}
 
         {(approveMutation.error || cancelMutation.error) && (
           <p className="mt-4 text-sm text-destructive">
