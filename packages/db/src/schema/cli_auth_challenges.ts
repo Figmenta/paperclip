@@ -11,6 +11,11 @@ export const cliAuthChallenges = pgTable(
     command: text("command").notNull(),
     clientName: text("client_name"),
     requestedAccess: text("requested_access").notNull().default("board"),
+    // Requested lifecycle class for the board key this challenge will mint.
+    // Carried from challenge creation through to approval so the mint path can
+    // issue a non-expiring "service" key vs an expiring "human_cli" key. The
+    // human approval step still gates every mint regardless of class. FIG-1673.
+    keyClass: text("key_class").notNull().default("human_cli"),
     requestedCompanyId: uuid("requested_company_id").references(() => companies.id, { onDelete: "set null" }),
     pendingKeyHash: text("pending_key_hash").notNull(),
     pendingKeyName: text("pending_key_name").notNull(),

@@ -8,6 +8,10 @@ export const boardApiKeys = pgTable(
     userId: text("user_id").notNull().references(() => authUsers.id, { onDelete: "cascade" }),
     name: text("name").notNull(),
     keyHash: text("key_hash").notNull(),
+    // Lifecycle class of the credential. "human_cli" keys expire per the
+    // board-key TTL policy (expires_at set); "service" keys are non-expiring
+    // (expires_at NULL) for unattended control-plane callers. See FIG-1673.
+    keyClass: text("key_class").notNull().default("human_cli"),
     lastUsedAt: timestamp("last_used_at", { withTimezone: true }),
     revokedAt: timestamp("revoked_at", { withTimezone: true }),
     expiresAt: timestamp("expires_at", { withTimezone: true }),

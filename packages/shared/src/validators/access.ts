@@ -70,10 +70,20 @@ export const boardCliAuthAccessLevelSchema = z.enum([
 
 export type BoardCliAuthAccessLevel = z.infer<typeof boardCliAuthAccessLevelSchema>;
 
+// Lifecycle class of the minted board key (FIG-1673):
+//   "human_cli" — expiring key (board-key TTL policy), the default.
+//   "service"   — non-expiring key for unattended control-plane callers.
+// Orthogonal to requestedAccess (scope); the human approval step gates every
+// mint regardless of class.
+export const boardApiKeyClassSchema = z.enum(["human_cli", "service"]);
+
+export type BoardApiKeyClass = z.infer<typeof boardApiKeyClassSchema>;
+
 export const createCliAuthChallengeSchema = z.object({
   command: z.string().min(1).max(240),
   clientName: z.string().max(120).optional().nullable(),
   requestedAccess: boardCliAuthAccessLevelSchema.default("board"),
+  keyClass: boardApiKeyClassSchema.default("human_cli"),
   requestedCompanyId: z.string().uuid().optional().nullable(),
 });
 
