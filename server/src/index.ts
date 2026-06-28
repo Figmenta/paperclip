@@ -30,6 +30,7 @@ import { loadConfig } from "./config.js";
 import { logger } from "./middleware/logger.js";
 import { setupLiveEventsWebSocketServer } from "./realtime/live-events-ws.js";
 import {
+  assertBoardApiKeyTtlPolicy,
   feedbackService,
   backfillPrincipalAccessCompatibility,
   heartbeatService,
@@ -90,6 +91,9 @@ export interface StartedServer {
 }
 
 export async function startServer(): Promise<StartedServer> {
+  // Fail loud if the effective board API key TTL has drifted from policy
+  // (e.g. a stale dist/ build served via `node dist/index.js`). See FIG-1672.
+  assertBoardApiKeyTtlPolicy();
   let config = loadConfig();
   initTelemetry({ enabled: config.telemetryEnabled });
   if (process.env.PAPERCLIP_SECRETS_PROVIDER === undefined) {

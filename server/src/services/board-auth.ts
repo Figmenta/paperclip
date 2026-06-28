@@ -14,6 +14,40 @@ import { conflict, forbidden, notFound } from "../errors.js";
 export const BOARD_API_KEY_TTL_MS = 180 * 24 * 60 * 60 * 1000;
 export const CLI_AUTH_CHALLENGE_TTL_MS = 10 * 60 * 1000;
 
+/**
+ * Independent restatement of the board API key lifetime policy (180 days),
+ * used as a startup tripwire by {@link assertBoardApiKeyTtlPolicy}.
+ *
+ * Why it exists (FIG-1672): `server/dist/` is a gitignored build artifact and
+ * the server `start` script runs `node dist/index.js`. A stale `dist/` built
+ * from an older `src` (when this TTL was 30 days) would silently regress the
+ * board key lifetime with no signal. This constant plus the startup assertion
+ * turn that silent drift into a loud startup failure.
+ *
+ * If you are deliberately changing the policy, update BOTH this value and
+ * {@link BOARD_API_KEY_TTL_MS} above.
+ */
+const BOARD_API_KEY_TTL_POLICY_MS = 180 * 24 * 60 * 60 * 1000;
+
+/**
+ * Fails loud at startup if the effective board API key TTL has drifted from
+ * policy. Accepts the effective value as an argument (defaulting to the live
+ * {@link BOARD_API_KEY_TTL_MS}) so the invariant is unit-testable for both the
+ * matching and mismatching cases. See FIG-1672.
+ */
+export function assertBoardApiKeyTtlPolicy(effectiveTtlMs: number = BOARD_API_KEY_TTL_MS): void {
+  if (effectiveTtlMs !== BOARD_API_KEY_TTL_POLICY_MS) {
+    const dayMs = 24 * 60 * 60 * 1000;
+    throw new Error(
+      `Board API key TTL policy violation: effective BOARD_API_KEY_TTL_MS=${effectiveTtlMs}ms ` +
+        `(${effectiveTtlMs / dayMs}d) does not match required policy ` +
+        `${BOARD_API_KEY_TTL_POLICY_MS}ms (${BOARD_API_KEY_TTL_POLICY_MS / dayMs}d). This usually means a ` +
+        `stale build is being served (e.g. 'node dist/index.js' against an outdated dist). Rebuild the ` +
+        `server with 'pnpm --filter @paperclipai/server build' so dist matches src. (FIG-1672)`,
+    );
+  }
+}
+
 export type CliAuthChallengeStatus = "pending" | "approved" | "cancelled" | "expired";
 
 export function hashBearerToken(token: string) {
