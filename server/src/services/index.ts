@@ -75,7 +75,7 @@ export type {
   AuthorizationDecision,
   AuthorizationResource,
 } from "./authorization.js";
-export { boardAuthService } from "./board-auth.js";
+export { boardAuthService, assertBoardApiKeyTtlPolicy } from "./board-auth.js";
 export { instanceSettingsService } from "./instance-settings.js";
 export { bootstrapExecutionPolicyFromEnv } from "./execution-policy-bootstrap.js";
 export { cloudUpstreamService, reconcileCloudUpstreamRunsOnStartup } from "./cloud-upstreams.js";
