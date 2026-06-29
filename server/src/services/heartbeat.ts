@@ -2395,7 +2395,14 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     cancelWorkForScope: cancelBudgetScopeWork,
   };
   const budgets = budgetService(db, budgetHooks);
-  const recovery = recoveryService(db, { enqueueWakeup });
+  const recovery = recoveryService(db, {
+    enqueueWakeup,
+    // Lets the active-run watchdog force-cancel a wedged silent run (FIG-1774).
+    // cancelRunInternal is a hoisted function declaration defined later in this
+    // closure, so referencing it here is safe.
+    cancelRun: (runId: string, reason?: string) =>
+      cancelRunInternal(runId, reason ?? "Auto-cancelled by active-run watchdog"),
+  });
   const productivityReviews = productivityReviewService(db, { enqueueWakeup });
   let unsafeTextProjectionPromise: Promise<boolean> | null = null;
 

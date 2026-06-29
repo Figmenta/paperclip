@@ -101,6 +101,17 @@ export { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 
 export const DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC = 1_800;
 
+// Default wall-clock ceiling for local + SSH adapter runs when the adapter
+// config leaves `timeoutSec` unset. Before FIG-1774 these targets returned `0`
+// (no adapter timeout), so a wedged local run (e.g. opencode hung 3h39m with
+// double token-burn) was never auto-killed. 90 minutes is a deliberately
+// generous ceiling: long enough not to clip a legitimate long build/agent run,
+// short enough that a wedged run does not burn quota indefinitely. An explicit
+// `config.timeoutSec > 0` always overrides this (per-task override); a negative
+// `config.timeoutSec` (or `disableTimeout`) is the documented opt-out escape
+// hatch that restores fully-unbounded behavior.
+export const DEFAULT_LOCAL_ADAPTER_TIMEOUT_SEC = 90 * 60;
+
 function parseObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
@@ -227,21 +238,36 @@ export function describeAdapterExecutionTarget(
 export function resolveAdapterExecutionTargetTimeoutSec(
   target: AdapterExecutionTarget | null | undefined,
   configuredTimeoutSec: number | null | undefined,
+  options?: { disableTimeout?: boolean },
 ): number {
+  // Escape hatch: an explicit opt-out restores fully-unbounded behavior. We
+  // cannot distinguish an explicit `timeoutSec: 0` from "unset" once the value
+  // reaches this resolver (callers normalize an absent field to 0), so a
+  // negative `configuredTimeoutSec` (e.g. `-1`) is the documented sentinel for
+  // "run unbounded" that flows through the existing `asNumber(config.timeoutSec, 0)`
+  // call sites without threading a new field. `disableTimeout` is the explicit
+  // programmatic equivalent.
+  const explicitDisableTimeout =
+    options?.disableTimeout === true ||
+    (typeof configuredTimeoutSec === "number" && Number.isFinite(configuredTimeoutSec) && configuredTimeoutSec < 0);
   const normalizedConfiguredTimeoutSec =
     typeof configuredTimeoutSec === "number" && Number.isFinite(configuredTimeoutSec) && configuredTimeoutSec > 0
       ? Math.floor(configuredTimeoutSec)
       : 0;
+  // An explicit per-task override always wins.
   if (normalizedConfiguredTimeoutSec > 0) return normalizedConfiguredTimeoutSec;
-  // Local and SSH adapters preserve the historical "0 means no adapter
-  // timeout" behavior. Sandbox-backed runs execute through provider RPCs
-  // that usually apply their own shorter command defaults, so request an
-  // explicit longer timeout for full adapter runs when the adapter leaves
-  // timeoutSec unset.
+  // Explicit opt-out: caller asked for an unbounded run.
+  if (explicitDisableTimeout) return 0;
+  // Sandbox-backed runs execute through provider RPCs that usually apply their
+  // own shorter command defaults, so request an explicit longer timeout for
+  // full adapter runs when the adapter leaves timeoutSec unset.
   if (target?.kind === "remote" && target.transport === "sandbox") {
     return DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC;
   }
-  return 0;
+  // Local and SSH adapters previously returned `0` (no adapter timeout) here,
+  // which let a wedged run hang indefinitely (FIG-1774). Apply a generous
+  // default ceiling so an unset config never means "unbounded".
+  return DEFAULT_LOCAL_ADAPTER_TIMEOUT_SEC;
 }
 
 function requireSandboxRunner(target: AdapterSandboxExecutionTarget): CommandManagedRuntimeRunner {

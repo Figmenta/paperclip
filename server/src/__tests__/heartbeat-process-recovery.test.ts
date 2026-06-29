@@ -958,7 +958,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(failedRun?.livenessReason).toContain("process_lost");
     expect(failedRun?.resultJson).toMatchObject({
       stopReason: "process_lost",
-      timeoutConfigured: false,
+      // codex_local now carries the default 5400s local-adapter timeout (FIG-1774).
+      effectiveTimeoutSec: 5400,
+      timeoutConfigured: true,
+      timeoutSource: "default",
       timeoutFired: false,
     });
     expect(retryRun?.status).toBe("queued");
@@ -1778,8 +1781,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(cancelled?.status).toBe("cancelled");
     expect(cancelled?.resultJson).toMatchObject({
       stopReason: "cancelled",
-      effectiveTimeoutSec: 0,
-      timeoutConfigured: false,
+      // codex_local now carries the default 5400s local-adapter timeout (FIG-1774).
+      effectiveTimeoutSec: 5400,
+      timeoutConfigured: true,
+      timeoutSource: "default",
       timeoutFired: false,
     });
   });

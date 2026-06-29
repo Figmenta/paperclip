@@ -223,6 +223,30 @@ describe("runAdapterExecutionTargetProcess", () => {
     vi.unstubAllEnvs();
   });
 
+  it("auto-kills a local child that exceeds its timeout and reports timedOut (FIG-1774)", async () => {
+    // End-to-end proof of the enforcement leg: a local target run that runs
+    // past its (short, test-override) timeout is force-terminated and the
+    // result is flagged timedOut. The 5400s default that an unset config now
+    // resolves to (resolveAdapterExecutionTargetTimeoutSec) rides this same
+    // path; here we use a 2s override so the test stays fast.
+    const result = await runAdapterExecutionTargetProcess(
+      "run-local-timeout",
+      { kind: "local" },
+      "sh",
+      ["-c", "sleep 30"],
+      {
+        cwd: process.cwd(),
+        env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+        timeoutSec: 2,
+        graceSec: 1,
+        onLog: async () => {},
+      },
+    );
+
+    expect(result.timedOut).toBe(true);
+    expect(result.exitCode).not.toBe(0);
+  }, 15_000);
+
   it("sanitizes inherited host env before SSH process execution", async () => {
     vi.stubEnv("PATH", "/host/bin:/usr/bin");
     vi.stubEnv("HOME", "/Users/local");
