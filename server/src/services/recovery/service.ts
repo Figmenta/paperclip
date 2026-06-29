@@ -67,6 +67,12 @@ const UNSUCCESSFUL_HEARTBEAT_RUN_TERMINAL_STATUSES = ["failed", "cancelled", "ti
 export const ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS = 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS = 4 * 60 * 60 * 1000;
 export const ACTIVE_RUN_OUTPUT_CONTINUE_REARM_MS = 30 * 60 * 1000;
+// After this many consecutive false-positive dismissals on the SAME run the
+// watchdog stops re-raising reviews and force-cancels the run instead. A run
+// that keeps re-arming (fresh output after each dismissal) yet is repeatedly
+// judged a false positive is, in practice, wedged in a non-productive loop —
+// at K dismissals we cut it rather than keep paging a human (FIG-1774).
+export const ACTIVE_RUN_FALSE_POSITIVE_AUTO_CANCEL_THRESHOLD = 3;
 const ACTIVE_RUN_OUTPUT_EVIDENCE_TAIL_BYTES = 8 * 1024;
 const STRANDED_ISSUE_RECOVERY_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.strandedIssueRecovery;
 const STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND = RECOVERY_ORIGIN_KINDS.staleActiveRunEvaluation;
@@ -400,7 +406,19 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
   ].join("\n");
 }
 
-export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
+export function recoveryService(
+  db: Db,
+  deps: {
+    enqueueWakeup: RecoveryWakeup;
+    // Force-cancel a heartbeat run. Injected (rather than importing the
+    // heartbeat service) to avoid a module cycle: heartbeat constructs the
+    // recovery service and passes its own `cancelRunInternal`. Optional so the
+    // recovery-service unit tests that don't exercise auto-cancel can keep
+    // constructing with just `enqueueWakeup`; when absent, the critical path
+    // falls back to the historical escalate-and-block behavior.
+    cancelRun?: (runId: string, reason?: string) => Promise<unknown>;
+  },
+) {
   const issuesSvc = issueService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -743,6 +761,132 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       )
       .limit(1);
     return row ?? null;
+  }
+
+  async function latestWatchdogDecision(companyId: string, runId: string) {
+    const [row] = await db
+      .select()
+      .from(heartbeatRunWatchdogDecisions)
+      .where(
+        and(
+          eq(heartbeatRunWatchdogDecisions.companyId, companyId),
+          eq(heartbeatRunWatchdogDecisions.runId, runId),
+        ),
+      )
+      .orderBy(desc(heartbeatRunWatchdogDecisions.createdAt))
+      .limit(1);
+    return row ?? null;
+  }
+
+  // Most recent already-closed (done/cancelled) stale-run evaluation for a run.
+  // Used to detect the close-reopen loop: a human/agent closing the review
+  // issue directly (status -> done) without going through the dismiss endpoint
+  // leaves no decision row, so the next scan would recreate the eval. We treat
+  // such a close as an implicit dismissal.
+  async function findLatestClosedStaleRunEvaluation(companyId: string, runId: string) {
+    const [row] = await db
+      .select({
+        id: issues.id,
+        identifier: issues.identifier,
+        status: issues.status,
+        updatedAt: issues.updatedAt,
+      })
+      .from(issues)
+      .where(
+        and(
+          eq(issues.companyId, companyId),
+          eq(issues.originKind, STALE_ACTIVE_RUN_EVALUATION_ORIGIN_KIND),
+          eq(issues.originId, runId),
+          inArray(issues.status, ["done", "cancelled"]),
+        ),
+      )
+      .orderBy(desc(issues.updatedAt))
+      .limit(1);
+    return row ?? null;
+  }
+
+  // Number of trailing `dismissed_false_positive` decisions for a run, counting
+  // back from the most recent decision until a non-dismissal is hit. A snooze /
+  // continue resets the streak (the run was deliberately allowed to run on).
+  async function countTrailingDismissedDecisions(companyId: string, runId: string) {
+    const rows = await db
+      .select({ decision: heartbeatRunWatchdogDecisions.decision })
+      .from(heartbeatRunWatchdogDecisions)
+      .where(
+        and(
+          eq(heartbeatRunWatchdogDecisions.companyId, companyId),
+          eq(heartbeatRunWatchdogDecisions.runId, runId),
+        ),
+      )
+      .orderBy(desc(heartbeatRunWatchdogDecisions.createdAt))
+      .limit(ACTIVE_RUN_FALSE_POSITIVE_AUTO_CANCEL_THRESHOLD + 1);
+    let count = 0;
+    for (const row of rows) {
+      if (row.decision === "dismissed_false_positive") count += 1;
+      else break;
+    }
+    return count;
+  }
+
+  // Record a system-attributed dismissal directly (no auth path) so the next
+  // scan suppresses regeneration. Mirrors the direct insert in
+  // foldSourceResolvedStaleRun.
+  async function recordSystemDismissedDecision(input: {
+    companyId: string;
+    runId: string;
+    evaluationIssueId: string | null;
+    reason: string;
+  }) {
+    const [row] = await db
+      .insert(heartbeatRunWatchdogDecisions)
+      .values({
+        companyId: input.companyId,
+        runId: input.runId,
+        evaluationIssueId: input.evaluationIssueId,
+        decision: "dismissed_false_positive",
+        reason: input.reason,
+      })
+      .returning();
+    return row;
+  }
+
+  // Decide whether a silent run should be suppressed from (re)generating a stale
+  // evaluation because it was already dismissed as a false positive. Re-arms
+  // only when genuinely fresh output arrived AFTER the dismissal — otherwise a
+  // manual close would loop forever (the FIG-1774 storm: 75 review issues from a
+  // close-reopen cycle).
+  async function evaluateActiveRunDismissalSuppression(
+    run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "lastOutputAt">,
+  ): Promise<{ suppressed: boolean; recordedDismissal: boolean }> {
+    const hasFreshOutputAfter = (since: Date | null | undefined) =>
+      Boolean(since && run.lastOutputAt && run.lastOutputAt.getTime() > since.getTime());
+
+    const latest = await latestWatchdogDecision(run.companyId, run.id);
+    if (latest?.decision === "dismissed_false_positive") {
+      // Already dismissed: suppress unless fresh output re-armed detection.
+      return { suppressed: !hasFreshOutputAfter(latest.createdAt), recordedDismissal: false };
+    }
+    if (latest && latest.decision !== "dismissed_false_positive") {
+      // The most recent decision is a snooze/continue. The snooze window is
+      // handled separately (latestActiveOutputQuietUntilDecision); if it has
+      // lapsed, fall through to normal evaluation.
+      return { suppressed: false, recordedDismissal: false };
+    }
+
+    // No decision rows at all. Detect the close-without-decision case: an eval
+    // issue that was closed directly. Treat it as an implicit dismissal so the
+    // loop closes, re-arming only on fresh output after the close.
+    const closed = await findLatestClosedStaleRunEvaluation(run.companyId, run.id);
+    if (closed && !hasFreshOutputAfter(closed.updatedAt)) {
+      await recordSystemDismissedDecision({
+        companyId: run.companyId,
+        runId: run.id,
+        evaluationIssueId: closed.id,
+        reason: "Evaluation issue was closed without an explicit watchdog decision; treated as a dismissed false positive.",
+      });
+      return { suppressed: true, recordedDismissal: true };
+    }
+    return { suppressed: false, recordedDismissal: false };
   }
 
   async function buildRunOutputSilence(
@@ -1348,6 +1492,79 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return true;
   }
 
+  // Force-cancel a wedged silent run and close out the watchdog state so it does
+  // not regenerate. Reached at the critical silence threshold, or after K
+  // consecutive false-positive dismissals on the same run. Requires
+  // deps.cancelRun; callers must guard on it.
+  async function autoCancelStaleRun(input: {
+    run: typeof heartbeatRuns.$inferSelect;
+    sourceIssue: typeof issues.$inferSelect | null;
+    existingEvaluation: Awaited<ReturnType<typeof findOpenStaleRunEvaluation>>;
+    trigger: "critical" | "repeated_false_positive";
+    silenceAgeMs: number | null;
+    dismissedCount?: number;
+  }): Promise<{ kind: "auto_cancelled"; evaluationIssueId: string | null }> {
+    if (!deps.cancelRun) throw new Error("autoCancelStaleRun requires deps.cancelRun");
+    const reason = input.trigger === "critical"
+      ? `Auto-cancelled by watchdog: ${formatDuration(input.silenceAgeMs)} of output silence past the critical threshold.`
+      : `Auto-cancelled by watchdog: ${input.dismissedCount ?? 0} consecutive false-positive dismissals on this run.`;
+    await deps.cancelRun(input.run.id, reason);
+
+    if (input.existingEvaluation && !isTerminalIssueStatus(input.existingEvaluation.status)) {
+      await issuesSvc.addComment(input.existingEvaluation.id, [
+        "Watchdog auto-cancelled the silent run.",
+        "",
+        `- Run: \`${input.run.id}\``,
+        `- Trigger: ${input.trigger === "critical" ? "critical output-silence threshold" : "repeated false-positive dismissals"}`,
+        `- ${reason}`,
+      ].join("\n"), { runId: input.run.id });
+      await issuesSvc.update(input.existingEvaluation.id, { status: "done" });
+    }
+
+    if (input.sourceIssue) {
+      const activeRecoveryAction = await recoveryActionsSvc.getActiveForIssue(input.run.companyId, input.sourceIssue.id);
+      if (activeRecoveryAction?.kind === "active_run_watchdog") {
+        await recoveryActionsSvc.resolveActiveForIssue({
+          companyId: input.run.companyId,
+          sourceIssueId: input.sourceIssue.id,
+          actionId: activeRecoveryAction.id,
+          status: "resolved",
+          outcome: "cancelled",
+          resolutionNote: reason,
+        });
+      }
+    }
+
+    const decision = await recordSystemDismissedDecision({
+      companyId: input.run.companyId,
+      runId: input.run.id,
+      evaluationIssueId: input.existingEvaluation?.id ?? null,
+      reason,
+    });
+
+    await logActivity(db, {
+      companyId: input.run.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: input.run.agentId,
+      runId: input.run.id,
+      action: "heartbeat.output_stale_auto_cancelled",
+      entityType: "heartbeat_run",
+      entityId: input.run.id,
+      details: {
+        source: "recovery.scan_silent_active_runs",
+        trigger: input.trigger,
+        silenceAgeMs: input.silenceAgeMs,
+        dismissedCount: input.dismissedCount ?? null,
+        evaluationIssueId: input.existingEvaluation?.id ?? null,
+        watchdogDecisionId: decision?.id ?? null,
+        reason,
+      },
+    });
+
+    return { kind: "auto_cancelled" as const, evaluationIssueId: input.existingEvaluation?.id ?? null };
+  }
+
   async function createOrUpdateStaleRunEvaluation(input: {
     run: typeof heartbeatRuns.$inferSelect;
     now: Date;
@@ -1405,6 +1622,35 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       now: input.now,
     });
     const level = (evidence.silenceAgeMs ?? 0) >= ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS ? "critical" : "suspicious";
+
+    // Auto-cancel a wedged run instead of paging a human, when we have a cancel
+    // hook. Two triggers: (1) the critical output-silence threshold, and (2) K
+    // consecutive false-positive dismissals on this same run. Without a cancel
+    // hook (e.g. recovery-service unit tests), fall through to the historical
+    // escalate-and-block behavior below.
+    if (deps.cancelRun) {
+      if (level === "critical") {
+        return autoCancelStaleRun({
+          run: input.run,
+          sourceIssue,
+          existingEvaluation: existing,
+          trigger: "critical",
+          silenceAgeMs: evidence.silenceAgeMs,
+        });
+      }
+      const dismissedCount = await countTrailingDismissedDecisions(input.run.companyId, input.run.id);
+      if (dismissedCount >= ACTIVE_RUN_FALSE_POSITIVE_AUTO_CANCEL_THRESHOLD) {
+        return autoCancelStaleRun({
+          run: input.run,
+          sourceIssue,
+          existingEvaluation: existing,
+          trigger: "repeated_false_positive",
+          silenceAgeMs: evidence.silenceAgeMs,
+          dismissedCount,
+        });
+      }
+    }
+
     if (existing) {
       if (level === "critical" && existing.priority !== "high") {
         await issuesSvc.update(existing.id, {
@@ -1541,6 +1787,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       escalated: 0,
       folded: 0,
       snoozed: 0,
+      dismissed: 0,
+      autoCancelled: 0,
       skipped: 0,
       evaluationIssueIds: [] as string[],
     };
@@ -1550,11 +1798,21 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
         result.snoozed += 1;
         continue;
       }
+      // Suppress regeneration for runs already dismissed as a false positive
+      // (or whose eval issue was closed without a decision), re-arming only on
+      // fresh output after the dismissal. This closes the close-reopen storm
+      // loop (FIG-1774).
+      const suppression = await evaluateActiveRunDismissalSuppression(run);
+      if (suppression.suppressed) {
+        result.dismissed += 1;
+        continue;
+      }
       const outcome = await createOrUpdateStaleRunEvaluation({ run, now });
       if (outcome.kind === "created") result.created += 1;
       else if (outcome.kind === "existing") result.existing += 1;
       else if (outcome.kind === "escalated") result.escalated += 1;
       else if (outcome.kind === "folded") result.folded += 1;
+      else if (outcome.kind === "auto_cancelled") result.autoCancelled += 1;
       else result.skipped += 1;
       if ("evaluationIssueId" in outcome && outcome.evaluationIssueId) {
         result.evaluationIssueIds.push(outcome.evaluationIssueId);

@@ -1,4 +1,29 @@
+import { DEFAULT_LOCAL_ADAPTER_TIMEOUT_SEC } from "@paperclipai/adapter-utils/execution-target";
+
 export type HeartbeatRunOutcome = "succeeded" | "failed" | "cancelled" | "timed_out";
+
+// Adapter types whose runs execute as local child processes (or over SSH) and
+// therefore receive `DEFAULT_LOCAL_ADAPTER_TIMEOUT_SEC` from
+// `resolveAdapterExecutionTargetTimeoutSec` when their config leaves
+// `timeoutSec` unset. Keeping this list in lockstep with the enforcement path
+// is what makes resultJson report `timeoutConfigured:true` /
+// `effectiveTimeoutSec:5400` / `timeoutSource:"default"` instead of the old
+// lying `timeoutConfigured:false` (the FIG-1774 incident symptom). The single
+// source of truth for the value is the shared constant imported above.
+//
+// Note: this is keyed on adapterType only, so it cannot see when a local
+// adapter is pinned to a sandbox execution target (where the effective default
+// is DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC instead). That edge case keeps
+// the historical approximation; the common local-execution case is exact.
+const LOCAL_DEFAULT_TIMEOUT_ADAPTER_TYPES = new Set([
+  "opencode_local",
+  "claude_local",
+  "codex_local",
+  "pi_local",
+  "grok_local",
+  "gemini_local",
+  "cursor",
+]);
 
 export type HeartbeatRunStopReason =
   | "completed"
@@ -38,7 +63,9 @@ function hasOwn(record: Record<string, unknown>, key: string) {
 }
 
 function defaultTimeoutSecForAdapter(adapterType: string) {
-  return adapterType === "openclaw_gateway" ? 120 : 0;
+  if (adapterType === "openclaw_gateway") return 120;
+  if (LOCAL_DEFAULT_TIMEOUT_ADAPTER_TYPES.has(adapterType)) return DEFAULT_LOCAL_ADAPTER_TIMEOUT_SEC;
+  return 0;
 }
 
 export function normalizeMaxTurnStopReason(value: unknown): Extract<HeartbeatRunStopReason, "max_turns_exhausted"> | null {

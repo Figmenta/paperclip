@@ -6,22 +6,46 @@ import {
 } from "./heartbeat-stop-metadata.js";
 
 describe("heartbeat stop metadata", () => {
-  it("keeps local coding adapters at no timeout by default", () => {
+  it("applies the default local-adapter timeout to local coding adapters (FIG-1774)", () => {
+    // These adapter types run as local child processes (or over SSH) and now
+    // receive DEFAULT_LOCAL_ADAPTER_TIMEOUT_SEC (5400) from the execution-target
+    // resolver when timeoutSec is unset. resultJson must report that truthfully
+    // instead of the old lying timeoutConfigured:false.
     for (const adapterType of [
       "codex_local",
       "claude_local",
       "cursor",
       "gemini_local",
+      "grok_local",
       "opencode_local",
       "pi_local",
-      "process",
     ]) {
+      expect(resolveHeartbeatRunTimeoutPolicy(adapterType, {})).toEqual({
+        effectiveTimeoutSec: 5400,
+        timeoutConfigured: true,
+        timeoutSource: "default",
+      });
+    }
+  });
+
+  it("keeps non-local-execution adapters unbounded by default", () => {
+    // Adapter types that do not flow through the local timeout resolver keep the
+    // historical "0 means unset / no default timeout" behavior.
+    for (const adapterType of ["process", "acpx_local", "cursor_cloud"]) {
       expect(resolveHeartbeatRunTimeoutPolicy(adapterType, {})).toEqual({
         effectiveTimeoutSec: 0,
         timeoutConfigured: false,
         timeoutSource: "default",
       });
     }
+  });
+
+  it("lets an explicit per-task timeoutSec override the local default", () => {
+    expect(resolveHeartbeatRunTimeoutPolicy("opencode_local", { timeoutSec: 120 })).toEqual({
+      effectiveTimeoutSec: 120,
+      timeoutConfigured: true,
+      timeoutSource: "config",
+    });
   });
 
   it("records configured timeout policy and timeout stop reason", () => {

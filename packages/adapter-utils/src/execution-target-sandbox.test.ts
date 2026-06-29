@@ -5,6 +5,7 @@ import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
+  DEFAULT_LOCAL_ADAPTER_TIMEOUT_SEC,
   DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC,
   adapterExecutionTargetSessionIdentity,
   adapterExecutionTargetToRemoteSpec,
@@ -112,6 +113,22 @@ describe("sandbox adapter execution targets", () => {
     });
   });
 
+  const sshTarget = {
+    kind: "remote" as const,
+    transport: "ssh" as const,
+    remoteCwd: "/workspace",
+    spec: {
+      host: "127.0.0.1",
+      port: 22,
+      username: "fixture",
+      remoteWorkspacePath: "/workspace",
+      remoteCwd: "/workspace",
+      privateKey: "KEY",
+      knownHosts: "host key",
+      strictHostKeyChecking: true,
+    },
+  };
+
   it("applies the remote sandbox fallback when adapter timeoutSec is unset", () => {
     const sandboxTarget: AdapterSandboxExecutionTarget = {
       kind: "remote",
@@ -120,25 +137,34 @@ describe("sandbox adapter execution targets", () => {
       runner: createLocalSandboxRunner(),
     };
 
+    // Sandbox branch is unchanged: unset -> sandbox default, explicit override wins.
     expect(resolveAdapterExecutionTargetTimeoutSec(sandboxTarget, 0)).toBe(
       DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC,
     );
     expect(resolveAdapterExecutionTargetTimeoutSec(sandboxTarget, 90)).toBe(90);
-    expect(resolveAdapterExecutionTargetTimeoutSec({
-      kind: "remote",
-      transport: "ssh",
-      remoteCwd: "/workspace",
-      spec: {
-        host: "127.0.0.1",
-        port: 22,
-        username: "fixture",
-        remoteWorkspacePath: "/workspace",
-        remoteCwd: "/workspace",
-        privateKey: "KEY",
-        knownHosts: "host key",
-        strictHostKeyChecking: true,
-      },
-    }, 0)).toBe(0);
+  });
+
+  it("applies the default local-adapter timeout for unset local + SSH targets (FIG-1774)", () => {
+    // Unset (0/null/undefined) on a local target now yields the 90-minute
+    // default instead of the old unbounded 0.
+    expect(resolveAdapterExecutionTargetTimeoutSec(undefined, 0)).toBe(DEFAULT_LOCAL_ADAPTER_TIMEOUT_SEC);
+    expect(resolveAdapterExecutionTargetTimeoutSec(null, null)).toBe(DEFAULT_LOCAL_ADAPTER_TIMEOUT_SEC);
+    expect(resolveAdapterExecutionTargetTimeoutSec({ kind: "local" }, undefined)).toBe(
+      DEFAULT_LOCAL_ADAPTER_TIMEOUT_SEC,
+    );
+    expect(resolveAdapterExecutionTargetTimeoutSec(sshTarget, 0)).toBe(DEFAULT_LOCAL_ADAPTER_TIMEOUT_SEC);
+
+    // An explicit per-task override always wins over the default.
+    expect(resolveAdapterExecutionTargetTimeoutSec({ kind: "local" }, 120)).toBe(120);
+    expect(resolveAdapterExecutionTargetTimeoutSec(sshTarget, 300)).toBe(300);
+  });
+
+  it("preserves an explicit unbounded opt-out for local targets", () => {
+    // Negative sentinel (flows through asNumber(config.timeoutSec, 0) at call sites).
+    expect(resolveAdapterExecutionTargetTimeoutSec({ kind: "local" }, -1)).toBe(0);
+    expect(resolveAdapterExecutionTargetTimeoutSec(sshTarget, -1)).toBe(0);
+    // Explicit programmatic opt-out flag.
+    expect(resolveAdapterExecutionTargetTimeoutSec({ kind: "local" }, 0, { disableTimeout: true })).toBe(0);
   });
 
   it("uses the caller timeout override when installing a missing sandbox command", async () => {

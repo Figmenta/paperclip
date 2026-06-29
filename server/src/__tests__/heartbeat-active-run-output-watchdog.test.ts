@@ -290,9 +290,9 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
     expect(evaluation?.description).not.toContain(leakedGithubToken);
   });
 
-  it("raises critical stale-run evaluations and blocks the source issue", async () => {
+  it("auto-cancels a run past the critical threshold without spawning an eval issue (FIG-1774 smoke a)", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
-    const { companyId, issueId } = await seedRunningRun({
+    const { companyId, runId } = await seedRunningRun({
       now,
       ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
     });
@@ -300,21 +300,48 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
 
     const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
 
-    expect(result.created).toBe(1);
-    const [evaluation] = await db
+    // Critical silence force-cancels the wedged run instead of paging a human.
+    expect(result).toMatchObject({ created: 0, escalated: 0, autoCancelled: 1 });
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("cancelled");
+    expect(run?.error).toContain("Auto-cancelled by watchdog");
+
+    // No new eval issue spawned.
+    const evaluations = await db
       .select()
       .from(issues)
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
-    expect(evaluation?.priority).toBe("high");
+    expect(evaluations).toHaveLength(0);
 
-    const [blocker] = await db
+    // A handled dismissal is recorded so a subsequent scan does not regenerate.
+    const decisions = await db
       .select()
-      .from(issueRelations)
-      .where(and(eq(issueRelations.companyId, companyId), eq(issueRelations.relatedIssueId, issueId)));
-    expect(blocker?.issueId).toBe(evaluation?.id);
+      .from(heartbeatRunWatchdogDecisions)
+      .where(eq(heartbeatRunWatchdogDecisions.runId, runId));
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]?.decision).toBe("dismissed_false_positive");
 
-    const [source] = await db.select().from(issues).where(eq(issues.id, issueId));
-    expect(source?.status).toBe("blocked");
+    // Idempotent: a second scan does not pick the now-cancelled run.
+    const second = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    expect(second).toMatchObject({ scanned: 0, autoCancelled: 0 });
+  });
+
+  it("does NOT touch a silent-but-alive run within the critical threshold (FIG-1774 smoke b)", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      // Suspicious (>1h) but below the 4h critical threshold.
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
+
+    // A sub-critical silent run is escalated for review, never cancelled.
+    expect(result).toMatchObject({ created: 1, autoCancelled: 0 });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("running");
   });
 
   it("folds terminal source issues with same-run durable evidence instead of creating watchdog work", async () => {
@@ -369,9 +396,12 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
 
   it("still escalates terminal source issues without same-run terminal evidence", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
+    // Sub-critical age: the anti-fold guard (don't mark succeeded without
+    // same-run evidence) escalates to a review issue. At/above the critical
+    // threshold this same shape is force-cancelled instead (see smoke a).
     const { companyId, runId } = await seedRunningRun({
       now,
-      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
       sourceStatus: "done",
     });
     const heartbeat = heartbeatService(db);
@@ -391,9 +421,11 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
 
   it("still escalates when a same-run comment is followed by another actor marking the source done", async () => {
     const now = new Date("2026-04-22T20:00:00.000Z");
+    // Sub-critical age so this exercises the escalate (anti-fold) path rather
+    // than the critical auto-cancel path.
     const { companyId, issueId, runId, issuePrefix } = await seedRunningRun({
       now,
-      ageMs: ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS + 60_000,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
       sourceStatus: "in_progress",
       sameRunTerminalEvidence: "comment",
     });
@@ -547,6 +579,139 @@ describeEmbeddedPostgres("active-run output watchdog", () => {
 
     expect(staleResult).toMatchObject({ created: 0, snoozed: 1 });
     expect(noisyResult).toMatchObject({ scanned: 0, created: 0 });
+  });
+
+  it("does not regenerate an eval after the review issue is closed without a decision (FIG-1774 smoke c)", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+
+    // First scan raises one review issue.
+    const first = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    expect(first.created).toBe(1);
+    const evaluationIssueId = first.evaluationIssueIds[0];
+    expect(evaluationIssueId).toBeTruthy();
+
+    // A human closes the review issue DIRECTLY (status -> done) without going
+    // through the dismiss endpoint. This is the exact storm trigger: the open
+    // eval disappears, so without suppression the next scan would recreate it.
+    const closedAt = new Date(now.getTime() + 60_000);
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt: closedAt, updatedAt: closedAt })
+      .where(eq(issues.id, evaluationIssueId!));
+
+    // A later scan must treat the run as dismissed and NOT spawn a new eval.
+    const later = new Date(now.getTime() + 15 * 60_000);
+    const second = await heartbeat.scanSilentActiveRuns({ now: later, companyId });
+    expect(second).toMatchObject({ created: 0, dismissed: 1 });
+
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(1);
+    expect(evaluations[0]?.status).toBe("done");
+
+    // An implicit dismissal decision is recorded so the loop stays closed.
+    const decisions = await db
+      .select()
+      .from(heartbeatRunWatchdogDecisions)
+      .where(eq(heartbeatRunWatchdogDecisions.runId, runId));
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]?.decision).toBe("dismissed_false_positive");
+
+    // And a third scan is still suppressed (no fresh output since the close).
+    const third = await heartbeat.scanSilentActiveRuns({ now: new Date(now.getTime() + 25 * 60_000), companyId });
+    expect(third).toMatchObject({ created: 0, dismissed: 1 });
+  });
+
+  it("re-arms detection when fresh output arrives after a dismissal (FIG-1774 re-arm)", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    expect(first.created).toBe(1);
+    const evaluationIssueId = first.evaluationIssueIds[0];
+
+    // Record an explicit dismissal and close the eval.
+    const decisionAt = new Date(now.getTime() + 60_000);
+    await db.insert(heartbeatRunWatchdogDecisions).values({
+      companyId,
+      runId,
+      evaluationIssueId,
+      decision: "dismissed_false_positive",
+      reason: "false positive",
+      createdAt: decisionAt,
+    });
+    await db
+      .update(issues)
+      .set({ status: "done", completedAt: decisionAt, updatedAt: decisionAt })
+      .where(eq(issues.id, evaluationIssueId!));
+
+    // No fresh output yet -> suppressed.
+    const suppressed = await heartbeat.scanSilentActiveRuns({ now: new Date(now.getTime() + 5 * 60_000), companyId });
+    expect(suppressed).toMatchObject({ created: 0, dismissed: 1 });
+
+    // Genuinely fresh output arrives AFTER the dismissal, then the run goes
+    // silent again past the suspicion threshold.
+    const freshOutputAt = new Date(now.getTime() + 6 * 60_000);
+    await db
+      .update(heartbeatRuns)
+      .set({ lastOutputAt: freshOutputAt, lastOutputSeq: 9, lastOutputStream: "stdout" })
+      .where(eq(heartbeatRuns.id, runId));
+
+    const later = new Date(freshOutputAt.getTime() + ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 60_000);
+    const rearmed = await heartbeat.scanSilentActiveRuns({ now: later, companyId });
+    expect(rearmed).toMatchObject({ created: 1, dismissed: 0 });
+  });
+
+  it("auto-cancels after K consecutive false-positive dismissals on the same run (FIG-1774)", async () => {
+    const now = new Date("2026-04-22T20:00:00.000Z");
+    const { companyId, runId } = await seedRunningRun({
+      now,
+      ageMs: ACTIVE_RUN_OUTPUT_SUSPICION_THRESHOLD_MS + 30 * 60_000,
+    });
+    // Last output 70 minutes ago: suspicious (>1h) but below the 4h critical
+    // threshold, so this exercises the K-dismissal trigger, not critical.
+    const lastOutputAt = new Date(now.getTime() - 70 * 60_000);
+    await db
+      .update(heartbeatRuns)
+      .set({ lastOutputAt, lastOutputSeq: 4, lastOutputStream: "stdout" })
+      .where(eq(heartbeatRuns.id, runId));
+
+    // Three prior dismissals, all BEFORE the latest output (so the run is
+    // re-armed, not suppressed, and reaches the K check).
+    for (let i = 0; i < 3; i += 1) {
+      await db.insert(heartbeatRunWatchdogDecisions).values({
+        companyId,
+        runId,
+        decision: "dismissed_false_positive",
+        reason: `false positive ${i}`,
+        createdAt: new Date(now.getTime() - (73 - i) * 60_000),
+      });
+    }
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.scanSilentActiveRuns({ now, companyId });
+    expect(result).toMatchObject({ created: 0, autoCancelled: 1 });
+
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
+    expect(run?.status).toBe("cancelled");
+    expect(run?.error).toContain("consecutive false-positive");
+
+    const evaluations = await db
+      .select()
+      .from(issues)
+      .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stale_active_run_evaluation")));
+    expect(evaluations).toHaveLength(0);
   });
 
   it("records watchdog decisions through recovery owner authorization", async () => {
