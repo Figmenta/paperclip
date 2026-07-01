@@ -473,6 +473,67 @@ const INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE =
   "link or request a pending approval, assign a human reviewer with assigneeUserId, set a typed executionState.currentParticipant through an execution policy, " +
   "or schedule an issue monitor for an external review/check. After creating one of those review paths, retry the status update.";
 
+// FIG-1817: machine-enforced "no done without a deliverable" gate.
+// Recurring fleet-discipline failure: agents mark a coding/build issue `done`
+// with no branch, no PR, no work product, no [deliverable] comment — silently
+// breaking downstream orchestration. This is the deterministic (no-LLM) gate at
+// the same enforcement point as the status change, mirroring the in_review gate.
+const DONE_REQUIRES_DELIVERABLE_MESSAGE =
+  "invalid_issue_disposition: done requires a deliverable. " +
+  "Before closing this issue as done, provide at least one verifiable deliverable: " +
+  "post a [deliverable] comment that links the branch/PR (or describes the artifact), " +
+  "register a work product (branch/PR/file), " +
+  "or — for genuinely artifact-less work — post a comment justifying it with `--no-artifact <reason>`. " +
+  "The issue stays in_progress until one of these is present.";
+
+// Marker an agent posts in a comment to declare the deliverable inline.
+const DELIVERABLE_COMMENT_MARKER = "[deliverable]";
+// Escape hatch for genuinely artifact-less work; must carry a justification.
+const NO_ARTIFACT_JUSTIFICATION_TOKEN = "--no-artifact";
+
+function commentTextSignalsDeliverable(text: string | null | undefined): boolean {
+  if (typeof text !== "string") return false;
+  return text.toLowerCase().includes(DELIVERABLE_COMMENT_MARKER);
+}
+
+// A bare "--no-artifact" is not enough; require a non-trivial justification after it.
+function commentTextSignalsNoArtifact(text: string | null | undefined): boolean {
+  if (typeof text !== "string") return false;
+  const idx = text.toLowerCase().indexOf(NO_ARTIFACT_JUSTIFICATION_TOKEN);
+  if (idx === -1) return false;
+  const justification = text.slice(idx + NO_ARTIFACT_JUSTIFICATION_TOKEN.length).trim();
+  return justification.length >= 3;
+}
+
+// FIG-1817 SCOPE PREDICATE — the single knob for "which done transitions are gated".
+// Default: scope B — gate only coding/build (action) issues, matching the issue's
+// stated scope ("an Issue whose type is action/coding"). There is no first-class issue
+// "type" column, so we detect action/coding work by any execution-workspace / execution
+// -run signal on the issue — the class where a false-done silently breaks downstream
+// orchestration (FIG-1802/1813). This is the fail-safe default: it never over-blocks the
+// many legitimate generic agent-done flows (dependency wakeups, comment lifecycle, etc.)
+// that carry no execution signal. To gate EVERY agent-authored done (scope A), replace
+// the body with `return true` — safe because the `--no-artifact <reason>` escape hatch
+// makes artifact-less closes one audited comment away. To key off dispatch conventions
+// (scope C), match the title prefix / labels. Kept isolated so the choice is one change.
+function issueRequiresDeliverableOnDone(existing: {
+  id: string;
+  status: string;
+  executionWorkspaceId?: string | null;
+  executionWorkspacePreference?: string | null;
+  executionRunId?: string | null;
+  executionLockedAt?: Date | string | null;
+  executionAgentNameKey?: string | null;
+}): boolean {
+  return Boolean(
+    existing.executionWorkspaceId
+    || existing.executionWorkspacePreference
+    || existing.executionRunId
+    || existing.executionLockedAt
+    || existing.executionAgentNameKey,
+  );
+}
+
 function executionPrincipalsEqual(
   left: ParsedExecutionState["currentParticipant"] | null,
   right: ParsedExecutionState["currentParticipant"] | null,
@@ -1168,6 +1229,87 @@ export function issueRoutes(
         "human_assignee_user_id",
         "typed_execution_state_current_participant",
         "scheduled_issue_monitor",
+      ],
+    });
+  }
+
+  // FIG-1817: block an agent-authored transition to `done` unless a verifiable
+  // deliverable exists. Deterministic, no-LLM. Fleet-wide (every company/agent),
+  // enforced at the status-change point. Blocked attempts are audited.
+  async function assertAgentDoneDeliverable(input: {
+    existing: {
+      id: string;
+      companyId: string;
+      identifier?: string | null;
+      status: string;
+      executionWorkspaceId?: string | null;
+      executionWorkspacePreference?: string | null;
+      executionRunId?: string | null;
+      executionLockedAt?: Date | string | null;
+      executionAgentNameKey?: string | null;
+    };
+    updateFields: Record<string, unknown>;
+    inboundComment?: string | null;
+    actor: ReturnType<typeof getActorInfo>;
+    actorType: string;
+  }) {
+    const nextStatus = typeof input.updateFields.status === "string"
+      ? input.updateFields.status
+      : input.existing.status;
+    // Only agent-authored transitions INTO done are gated; humans and no-op
+    // re-saves of an already-done issue are exempt.
+    if (input.actorType !== "agent") return;
+    if (input.existing.status === "done" || nextStatus !== "done") return;
+    if (!issueRequiresDeliverableOnDone(input.existing)) return;
+
+    // Signal 1: a comment posted in this very PATCH (one-shot close-with-deliverable).
+    if (commentTextSignalsDeliverable(input.inboundComment)
+      || commentTextSignalsNoArtifact(input.inboundComment)) {
+      return;
+    }
+
+    // Signal 2: a registered work product (branch / PR / file / ...).
+    const workProducts = await workProductsSvc.listForIssue(input.existing.id);
+    if (workProducts.length > 0) return;
+
+    // Signal 3: a prior [deliverable] comment, or a --no-artifact justification
+    // posted by the closing agent.
+    const comments = await svc.listComments(input.existing.id, { order: "desc", limit: 500 });
+    const closingAgentId = input.actor.agentId ?? null;
+    const hasDeliverableSignal = comments.some((comment) => {
+      if (commentTextSignalsDeliverable(comment.body)) return true;
+      // --no-artifact must be authored by the closing agent (per scope point 1).
+      if (commentTextSignalsNoArtifact(comment.body)) {
+        return !closingAgentId || comment.authorAgentId === closingAgentId;
+      }
+      return false;
+    });
+    if (hasDeliverableSignal) return;
+
+    // Audit every blocked false-close so we can see who was about to false-close.
+    await logActivity(db, {
+      companyId: input.existing.companyId,
+      actorType: input.actor.actorType,
+      actorId: input.actor.actorId,
+      agentId: input.actor.agentId,
+      runId: input.actor.runId,
+      action: "issue.done_blocked_missing_deliverable",
+      entityType: "issue",
+      entityId: input.existing.id,
+      details: {
+        identifier: input.existing.identifier ?? null,
+        fromStatus: input.existing.status,
+        attemptedStatus: nextStatus,
+      },
+    });
+
+    throw unprocessable(DONE_REQUIRES_DELIVERABLE_MESSAGE, {
+      code: "invalid_issue_disposition",
+      missing: "deliverable",
+      validDeliverables: [
+        "deliverable_comment",
+        "linked_work_product",
+        "no_artifact_justification",
       ],
     });
   }
@@ -3625,6 +3767,14 @@ export function issueRoutes(
     await assertAgentInReviewReviewPath({
       existing,
       updateFields,
+      actorType: req.actor.type,
+    });
+
+    await assertAgentDoneDeliverable({
+      existing,
+      updateFields,
+      inboundComment: commentBody,
+      actor,
       actorType: req.actor.type,
     });
 
