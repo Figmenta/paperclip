@@ -1,4 +1,5 @@
 /// <reference path="./types/express.d.ts" />
+import type { ChildProcess } from "node:child_process";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve } from "node:path";
@@ -46,6 +47,10 @@ import { createStorageServiceFromConfig } from "./storage/index.js";
 import { printStartupBanner } from "./startup-banner.js";
 import { getBoardClaimWarningUrl, initializeBoardClaimChallenge } from "./board-claim.js";
 import { maybePersistWorktreeRuntimePorts } from "./worktree-config.js";
+import {
+  attachEmbeddedPostgresSupervisor,
+  readEmbeddedPostgresRespawnPolicyFromEnv,
+} from "./embedded-postgres-supervisor.js";
 import { initTelemetry, getTelemetryClient } from "./telemetry.js";
 import { conflict } from "./errors.js";
 import type {
@@ -68,6 +73,12 @@ type EmbeddedPostgresInstance = {
   initialise(): Promise<void>;
   start(): Promise<void>;
   stop(): Promise<void>;
+  /**
+   * The postmaster child process, assigned by the library's `start()`. Exposed
+   * by `embedded-postgres` but absent from its public typings; used by the
+   * exit supervisor to watch for unexpected PG child death (FIG-2068).
+   */
+  process?: ChildProcess | undefined;
 };
 
 type EmbeddedPostgresCtor = new (opts: {
@@ -296,6 +307,9 @@ export async function startServer(): Promise<StartedServer> {
   let pluginMigrationDb;
   let embeddedPostgres: EmbeddedPostgresInstance | null = null;
   let embeddedPostgresStartedByThisProcess = false;
+  // Set just before an intentional cluster stop so the exit supervisor treats
+  // the ensuing child exit as expected rather than an unexpected death.
+  let embeddedPostgresIntentionalShutdown = false;
   let migrationSummary: MigrationSummary = "skipped";
   let activeDatabaseConnectionString: string;
   let resolvedEmbeddedPostgresPort: number | null = null;
@@ -452,9 +466,20 @@ export async function startServer(): Promise<StartedServer> {
           });
         }
         embeddedPostgresStartedByThisProcess = true;
+        // Watch the postmaster child for unexpected death: log exit code +
+        // signal + uptime under `embedded-postgres-exit`, and optionally respawn
+        // just the PG child (opt-in via PAPERCLIP_EMBEDDED_POSTGRES_SUPERVISE).
+        attachEmbeddedPostgresSupervisor({
+          instance: embeddedPostgres,
+          logger,
+          port,
+          dataDir,
+          isShuttingDown: () => embeddedPostgresIntentionalShutdown,
+          respawn: readEmbeddedPostgresRespawnPolicyFromEnv(),
+        });
       }
     }
-  
+
     const embeddedAdminConnectionString = `postgres://paperclip:paperclip@127.0.0.1:${port}/postgres`;
     const dbStatus = await ensurePostgresDatabase(embeddedAdminConnectionString, "paperclip");
     if (dbStatus === "created") {
@@ -933,6 +958,9 @@ export async function startServer(): Promise<StartedServer> {
       appShutdown?.();
 
       if (embeddedPostgres && embeddedPostgresStartedByThisProcess) {
+        // Mark the stop as intentional so the exit supervisor does not treat the
+        // ensuing postmaster exit as an unexpected death (no error log, no respawn).
+        embeddedPostgresIntentionalShutdown = true;
         logger.info({ signal }, "Stopping embedded PostgreSQL");
         try {
           await embeddedPostgres?.stop();
