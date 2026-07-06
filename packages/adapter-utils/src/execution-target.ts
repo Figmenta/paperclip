@@ -104,6 +104,7 @@ export interface AdapterExecutionTargetPaperclipBridgeHandle {
 export { sanitizeRemoteExecutionEnv } from "./remote-execution-env.js";
 
 export const DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC = 1_800;
+export const DEFAULT_LOCAL_ADAPTER_TIMEOUT_SEC = 5_400; // 90 min
 
 function parseObject(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value)
@@ -244,6 +245,9 @@ export function resolveAdapterExecutionTargetTimeoutSec(
   // timeoutSec unset.
   if (target?.kind === "remote" && target.transport === "sandbox") {
     return DEFAULT_REMOTE_SANDBOX_ADAPTER_TIMEOUT_SEC;
+  }
+  if (target?.kind === "local" || (target?.kind === "remote" && target.transport === "ssh")) {
+    return DEFAULT_LOCAL_ADAPTER_TIMEOUT_SEC;
   }
   return 0;
 }

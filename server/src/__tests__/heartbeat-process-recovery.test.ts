@@ -1009,7 +1009,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(failedRun?.livenessReason).toContain("process_lost");
     expect(failedRun?.resultJson).toMatchObject({
       stopReason: "process_lost",
-      timeoutConfigured: false,
+      timeoutConfigured: true,
       timeoutFired: false,
     });
     expect(["queued", "running"]).toContain(retryRun?.status);
@@ -2232,8 +2232,8 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(cancelled?.status).toBe("cancelled");
     expect(cancelled?.resultJson).toMatchObject({
       stopReason: "cancelled",
-      effectiveTimeoutSec: 0,
-      timeoutConfigured: false,
+      effectiveTimeoutSec: 5400,
+      timeoutConfigured: true,
       timeoutFired: false,
     });
   });

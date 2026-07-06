@@ -468,7 +468,7 @@ function buildLivenessOriginalIssueComment(finding: IssueLivenessFinding, escala
   ].join("\n");
 }
 
-export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup }) {
+export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup; cancelRun?: (runId: string, reason?: string) => Promise<unknown> }) {
   const issuesSvc = issueService(db);
   const recoveryActionsSvc = issueRecoveryActionService(db);
   const treeControlSvc = issueTreeControlService(db);
@@ -952,9 +952,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   // Returns true when a reviewer has already dismissed this run's silence as a false positive.
   // Used to prevent re-filing after a deliberate close — while still allowing legitimate
   // re-arm after a "continue" decision's snooze window expires.
-  async function hasDismissedFalsePositiveDecision(companyId: string, runId: string) {
+  async function latestDismissedFalsePositiveDecision(companyId: string, runId: string) {
     const [row] = await db
-      .select({ id: heartbeatRunWatchdogDecisions.id })
+      .select({ id: heartbeatRunWatchdogDecisions.id, createdAt: heartbeatRunWatchdogDecisions.createdAt })
       .from(heartbeatRunWatchdogDecisions)
       .where(
         and(
@@ -963,8 +963,28 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           eq(heartbeatRunWatchdogDecisions.decision, "dismissed_false_positive"),
         ),
       )
+      .orderBy(desc(heartbeatRunWatchdogDecisions.createdAt))
       .limit(1);
+    return row ?? null;
+  }
+
+  async function hasDismissedFalsePositiveDecision(companyId: string, runId: string) {
+    const row = await latestDismissedFalsePositiveDecision(companyId, runId);
     return row != null;
+  }
+
+  async function countDismissedFalsePositiveDecisions(companyId: string, runId: string) {
+    const rows = await db
+      .select({ id: heartbeatRunWatchdogDecisions.id })
+      .from(heartbeatRunWatchdogDecisions)
+      .where(
+        and(
+          eq(heartbeatRunWatchdogDecisions.companyId, companyId),
+          eq(heartbeatRunWatchdogDecisions.runId, runId),
+          eq(heartbeatRunWatchdogDecisions.decision, "dismissed_false_positive"),
+        ),
+      );
+    return rows.length;
   }
 
   async function buildRunOutputSilence(
@@ -1640,8 +1660,15 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     // Dedup: if a reviewer has dismissed this run's silence as a false positive, don't re-file.
     // A "continue" decision with a snooze window is allowed to re-arm normally — only an
     // explicit dismissed_false_positive blocks all further alerts for this run.
-    if (await hasDismissedFalsePositiveDecision(input.run.companyId, input.run.id)) {
-      return { kind: "skipped" as const };
+    // Exception: if there has been fresh output AFTER the most recent dismissal, re-arm the
+    // watchdog so that a genuinely new silence period is evaluated.
+    const latestDismissal = await latestDismissedFalsePositiveDecision(input.run.companyId, input.run.id);
+    if (latestDismissal) {
+      const lastOutputAt = input.run.lastOutputAt ?? null;
+      if (!lastOutputAt || lastOutputAt <= latestDismissal.createdAt) {
+        return { kind: "skipped" as const };
+      }
+      // fresh output after dismissal — fall through to re-evaluate
     }
 
     // Dedup: if a prior evaluation issue for this run was closed `done` on the board
@@ -1701,6 +1728,34 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       now: input.now,
     });
     const level = (evidence.silenceAgeMs ?? 0) >= ACTIVE_RUN_OUTPUT_CRITICAL_THRESHOLD_MS ? "critical" : "suspicious";
+
+    // Auto-cancel: at critical level with 3+ prior dismissals, cancel the run rather than
+    // creating/escalating a recovery issue indefinitely.
+    if (level === "critical" && deps.cancelRun) {
+      const dismissedCount = await countDismissedFalsePositiveDecisions(input.run.companyId, input.run.id);
+      const silenceAgeMs = evidence.silenceAgeMs ?? 0;
+      if (dismissedCount >= 3) {
+        const reason = `Auto-cancelled by watchdog: run dismissed as false positive ${dismissedCount} times with continued silence (silent for ${formatDuration(silenceAgeMs)}).`;
+        await deps.cancelRun(input.run.id, reason);
+        // Record a dismissed_false_positive decision as the system cancel record.
+        await db.insert(heartbeatRunWatchdogDecisions).values({
+          companyId: input.run.companyId,
+          runId: input.run.id,
+          evaluationIssueId: existing?.id ?? null,
+          decision: "dismissed_false_positive",
+          snoozedUntil: null,
+          reason,
+          createdByAgentId: null,
+          createdByUserId: null,
+          createdByRunId: null,
+        });
+        if (existing) {
+          await issuesSvc.update(existing.id, { status: "done" });
+        }
+        return { kind: "skipped" as const };
+      }
+    }
+
     if (existing) {
       if (level === "critical" && existing.priority !== "high") {
         await issuesSvc.update(existing.id, {
