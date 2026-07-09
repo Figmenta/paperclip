@@ -7196,6 +7196,7 @@ export function issueRoutes(
 
     void queueIssueAssignmentWakeup({
       heartbeat,
+      db,
       issue,
       reason: "issue_assigned",
       mutation: "create",
@@ -7362,6 +7363,7 @@ export function issueRoutes(
     if (!serializationContext || !currentSerializedChild) {
       void queueIssueAssignmentWakeup({
         heartbeat,
+        db,
         issue,
         reason: "issue_assigned",
         mutation: "create",
@@ -7565,6 +7567,7 @@ export function issueRoutes(
       if (!serializedBlockedChildIds.has(issue.id)) {
         void queueIssueAssignmentWakeup({
           heartbeat,
+          db,
           issue,
           reason: "issue_assigned",
           mutation: "accepted_plan_decomposition",
@@ -9201,6 +9204,7 @@ export function issueRoutes(
       for (const createdIssue of createdIssues) {
         void queueIssueAssignmentWakeup({
           heartbeat,
+          db,
           issue: createdIssue,
           reason: "issue_assigned",
           mutation: "interaction_accept",
