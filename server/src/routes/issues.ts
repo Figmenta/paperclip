@@ -1124,6 +1124,84 @@ export function issueRoutes(
   });
   const feedback = feedbackService(db);
   const companiesSvc = companyService(db);
+
+  // FIG-63 Layer 1: surface a not_invokable dispatch (an issue assigned to a paused /
+  // terminated / pending_approval agent, or one with a broken reporting chain) LOUDLY —
+  // a SYSTEM comment on the issue rail PLUS a structured activity event — instead of the
+  // old silent WARN-and-null. Passed to every queueIssueAssignmentWakeup call site so the
+  // FIG-60 class ("dispatch looked successful, produced nothing, raised no alarm") can
+  // never recur. Best-effort throughout: a failure to comment/log is itself logged, never
+  // thrown back onto the assignment hot path.
+  const reportAssigneeNotInvokable = async (info: {
+    issue: { id: string; assigneeAgentId: string | null; status: string };
+    reason: string;
+    agentStatus: string | null;
+    message: string;
+  }) => {
+    const agentId = info.issue.assigneeAgentId;
+    let agentName: string | null = null;
+    let companyId: string | null = null;
+    try {
+      const row = await db
+        .select({ companyId: issueRows.companyId })
+        .from(issueRows)
+        .where(eq(issueRows.id, info.issue.id))
+        .then((rows) => rows[0] ?? null);
+      companyId = row?.companyId ?? null;
+    } catch (err) {
+      logger.warn({ err, issueId: info.issue.id }, "not_invokable surface: company lookup failed");
+    }
+    if (agentId) {
+      try {
+        const row = await db
+          .select({ name: agents.name })
+          .from(agents)
+          .where(eq(agents.id, agentId))
+          .then((rows) => rows[0] ?? null);
+        agentName = row?.name ?? null;
+      } catch (err) {
+        logger.warn({ err, agentId }, "not_invokable surface: agent name lookup failed");
+      }
+    }
+    const label = agentName
+      ? `${agentName} (${info.agentStatus ?? "unknown"})`
+      : info.agentStatus ?? "unknown";
+    const body =
+      `⚠️ Assignee ${label} is not invokable (${info.reason}); no run was opened for this ` +
+      `assignment. Resume the agent (POST /api/agents/${agentId ?? "<id>"}/resume) or reassign ` +
+      `to an invokable agent. — FIG-63 dispatch guard`;
+    try {
+      await svc.addComment(
+        info.issue.id,
+        body,
+        { runId: null },
+        { authorType: "system" },
+      );
+    } catch (err) {
+      logger.warn({ err, issueId: info.issue.id }, "not_invokable surface: system comment failed");
+    }
+    if (companyId) {
+      try {
+        await logActivity(db, {
+          companyId,
+          actorType: "system",
+          actorId: "system",
+          action: "issue.assignee_not_invokable",
+          entityType: "issue",
+          entityId: info.issue.id,
+          details: {
+            assigneeAgentId: agentId,
+            agentName,
+            agentStatus: info.agentStatus,
+            reason: info.reason,
+          },
+        });
+      } catch (err) {
+        logger.warn({ err, issueId: info.issue.id }, "not_invokable surface: activity log failed");
+      }
+    }
+  };
+
   let searchSvc = opts.searchService ?? null;
   const getSearchService = () => {
     searchSvc ??= companySearchService(db);
@@ -5270,6 +5348,7 @@ export function issueRoutes(
       contextSource: "issue.create",
       requestedByActorType: actor.actorType,
       requestedByActorId: actor.actorId,
+      reportNotInvokable: reportAssigneeNotInvokable,
     });
     await queueTaskWatchdogEvaluation(issue, actor.runId);
 
@@ -5429,6 +5508,7 @@ export function issueRoutes(
         contextSource: "issue.child_create",
         requestedByActorType: actor.actorType,
         requestedByActorId: actor.actorId,
+        reportNotInvokable: reportAssigneeNotInvokable,
       });
     }
     await blockWatchdogParentOnCurrentChild({
@@ -5629,6 +5709,7 @@ export function issueRoutes(
           contextSource: "issue.accepted_plan_decomposition",
           requestedByActorType: actor.actorType,
           requestedByActorId: actor.actorId,
+          reportNotInvokable: reportAssigneeNotInvokable,
         });
       }
       await queueTaskWatchdogEvaluation(issue, actor.runId);
@@ -7118,6 +7199,7 @@ export function issueRoutes(
           contextSource: "issue.interaction.accept",
           requestedByActorType: actor.actorType,
           requestedByActorId: actor.actorId,
+          reportNotInvokable: reportAssigneeNotInvokable,
         });
       }
 
