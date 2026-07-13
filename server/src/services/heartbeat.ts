@@ -237,6 +237,14 @@ const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+// FIG-132: absolute-age ceiling for reapOrphanedRuns. A run still `status=running`
+// past this age with no fresh liveness signal is finalized regardless of an
+// in-memory process handle or a (by now almost certainly recycled) live pid, so an
+// orphaned run can never hold an issue checkout indefinitely — the FIG-131 symptom.
+// Default-disabled in the reaper (0) and switched on explicitly by the prod call
+// sites, mirroring the `staleThresholdMs` precedent so unit fixtures are unaffected.
+const REAP_HARD_TTL_MS = 30 * 60 * 1000;
+const HARD_TTL_REAP_ERROR_CODE = "process_hard_ttl_reaped";
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
@@ -8095,8 +8103,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; hardTtlMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
+    const hardTtlMs = opts?.hardTtlMs ?? 0;
     const now = new Date();
 
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
@@ -8113,6 +8122,86 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reaped: string[] = [];
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
+      // FIG-132 hard-TTL backstop: a run still `running` past the absolute-age
+      // ceiling is finalized OVER the in-memory-handle and live-pid guards below.
+      // Past the ceiling an in-memory entry is almost certainly a leak and a live
+      // pid almost certainly a reuse, so neither may keep a dead run pinned at
+      // `running`/`null` liveness holding an issue checkout (FIG-131).
+      if (hardTtlMs > 0) {
+        const freshnessTs = Math.max(
+          run.lastOutputAt ? new Date(run.lastOutputAt).getTime() : 0,
+          run.lastUsefulActionAt ? new Date(run.lastUsefulActionAt).getTime() : 0,
+          run.updatedAt ? new Date(run.updatedAt).getTime() : 0,
+          run.startedAt ? new Date(run.startedAt).getTime() : 0,
+        );
+        const ageMs = freshnessTs > 0 ? now.getTime() - freshnessTs : Number.POSITIVE_INFINITY;
+        if (ageMs > hardTtlMs) {
+          const inMemoryHandle = runningProcesses.has(run.id) || activeRunExecutions.has(run.id);
+          const ageLabel = Number.isFinite(ageMs) ? `${Math.round(ageMs / 60_000)}m` : "unknown age";
+          const hardTtlMessage =
+            `Run exceeded hard TTL (${ageLabel}, ceiling ${Math.round(hardTtlMs / 60_000)}m) while still \`running\`; ` +
+            `finalized regardless of in-memory handle (${inMemoryHandle ? "present" : "absent"}) or ` +
+            `recorded pid ${run.processPid ?? "none"} (assumed recycled past the ceiling).`;
+          let finalizedRun = await setRunStatus(run.id, "failed", {
+            error: hardTtlMessage,
+            errorCode: HARD_TTL_REAP_ERROR_CODE,
+            finishedAt: now,
+            resultJson: mergeRunStopMetadataForAgent(
+              { adapterType, adapterConfig },
+              "failed",
+              {
+                resultJson: parseObject(run.resultJson),
+                errorCode: HARD_TTL_REAP_ERROR_CODE,
+                errorMessage: hardTtlMessage,
+              },
+            ),
+          });
+          await setWakeupStatus(run.wakeupRequestId, "failed", {
+            finishedAt: now,
+            error: hardTtlMessage,
+          });
+          if (!finalizedRun) finalizedRun = await getRun(run.id);
+          if (!finalizedRun) {
+            runningProcesses.delete(run.id);
+            activeRunExecutions.delete(run.id);
+            continue;
+          }
+          // Always reclassify so livenessState never stays null on a reaped run.
+          finalizedRun =
+            (await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson))) ?? finalizedRun;
+          await releaseEnvironmentLeasesForRun({
+            runId: finalizedRun.id,
+            companyId: finalizedRun.companyId,
+            agentId: finalizedRun.agentId,
+            status: finalizedRun.status,
+            failureReason: finalizedRun.error ?? undefined,
+          });
+          // A hard-TTL reap is definitive (the run is dead, not transiently lost),
+          // so release + promote the issue rather than queueing a process-loss retry.
+          await releaseIssueExecutionAndPromote(finalizedRun);
+          await appendRunEvent(finalizedRun, await nextRunEventSeq(finalizedRun.id), {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "error",
+            message: hardTtlMessage,
+            payload: {
+              hardTtlReaped: true,
+              hardTtlMs,
+              ...(Number.isFinite(ageMs) ? { ageMs } : {}),
+              inMemoryHandle,
+              ...(run.processPid ? { processPid: run.processPid } : {}),
+              ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
+            },
+          });
+          await finalizeAgentStatus(run.agentId, "failed", hardTtlMessage);
+          await startNextQueuedRunForAgent(run.agentId);
+          runningProcesses.delete(run.id);
+          activeRunExecutions.delete(run.id);
+          reaped.push(run.id);
+          continue;
+        }
+      }
+
       if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
 
       // Apply staleness threshold to avoid false positives

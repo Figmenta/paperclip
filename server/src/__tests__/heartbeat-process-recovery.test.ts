@@ -976,6 +976,66 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(wakeup?.status).toBe("claimed");
   });
 
+  it("hard-TTL reaps a run stuck past the ceiling despite a live pid, releases its checkout, and never leaves liveness null", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+    expect(child.pid).toBeTypeOf("number");
+
+    // seedRunFixture timestamps the run in the fixed past (2026-03-19), i.e. far
+    // beyond any real hard-TTL ceiling, so a live pid would normally keep it
+    // pinned at `running` (see the sibling "keeps a local run active" test).
+    const { runId, issueId } = await seedRunFixture({
+      agentStatus: "idle",
+      processPid: child.pid ?? null,
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({ hardTtlMs: 30 * 60 * 1000 });
+    expect(result.reaped).toBe(1);
+    expect(result.runIds).toEqual([runId]);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("failed");
+    expect(run?.errorCode).toBe("process_hard_ttl_reaped");
+    expect(run?.error).toContain("hard TTL");
+    // The reaper must always reclassify so livenessState never stays null.
+    expect(run?.livenessState).toBeTruthy();
+    expect(run?.finishedAt).toBeTruthy();
+
+    const releasedIssue = await waitForValue(async () =>
+      db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => {
+        const row = rows[0] ?? null;
+        return row?.checkoutRunId === null ? row : null;
+      }),
+    );
+    expect(releasedIssue?.checkoutRunId).toBeNull();
+  });
+
+  it("hard-TTL leaves a run with a recent liveness signal untouched", async () => {
+    const child = spawnAliveProcess();
+    childProcesses.add(child);
+
+    const { runId } = await seedRunFixture({
+      agentStatus: "idle",
+      processPid: child.pid ?? null,
+      includeIssue: false,
+    });
+    // Refresh the liveness signal to "now" so it is well within the ceiling.
+    await db
+      .update(heartbeatRuns)
+      .set({ updatedAt: new Date(), startedAt: new Date() })
+      .where(eq(heartbeatRuns.id, runId));
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reapOrphanedRuns({ hardTtlMs: 30 * 60 * 1000 });
+    expect(result.runIds).not.toContain(runId);
+
+    const run = await heartbeat.getRun(runId);
+    expect(run?.status).toBe("running");
+    // Falls through to the live-pid guard, which marks it detached but keeps it running.
+    expect(run?.errorCode).toBe("process_detached");
+  });
+
   it("queues exactly one retry when the recorded local pid is dead", async () => {
     const { agentId, runId, issueId } = await seedRunFixture({
       agentStatus: "idle",
@@ -2825,6 +2885,131 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     if (runId) {
       await waitForRunToSettle(heartbeat, runId);
     }
+  });
+
+  it("bounds unassigned_blocker_recovery: escalates once the attempt cap is reached instead of re-spawning", async () => {
+    const companyId = randomUUID();
+    const creatorAgentId = randomUUID();
+    const blockedAssigneeAgentId = randomUUID();
+    const blockerIssueId = randomUUID();
+    const blockedIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values([
+      {
+        id: creatorAgentId,
+        companyId,
+        name: "SecurityEngineer",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+      {
+        id: blockedAssigneeAgentId,
+        companyId,
+        name: "CodexCoder",
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      },
+    ]);
+    await db.insert(issues).values([
+      {
+        id: blockerIssueId,
+        companyId,
+        title: "Fix blocker",
+        status: "todo",
+        priority: "high",
+        createdByAgentId: creatorAgentId,
+        issueNumber: 1,
+        identifier: `${issuePrefix}-1`,
+      },
+      {
+        id: blockedIssueId,
+        companyId,
+        title: "Blocked work",
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: blockedAssigneeAgentId,
+        issueNumber: 2,
+        identifier: `${issuePrefix}-2`,
+      },
+    ]);
+    await db.insert(issueRelations).values({
+      companyId,
+      issueId: blockerIssueId,
+      relatedIssueId: blockedIssueId,
+      type: "blocks",
+      createdByAgentId: creatorAgentId,
+    });
+
+    // Simulate that Paperclip has already re-spawned recovery for this blocker up to
+    // the cap (3) — the pre-fix behaviour would re-assign + wake a 4th time.
+    const priorWakeCount = 3;
+    await db.insert(agentWakeupRequests).values(
+      Array.from({ length: priorWakeCount }, (_unused, index) => ({
+        id: randomUUID(),
+        companyId,
+        agentId: creatorAgentId,
+        source: "automation",
+        triggerDetail: "system",
+        reason: "issue_assigned",
+        payload: { issueId: blockerIssueId, mutation: "unassigned_blocker_recovery" },
+        status: "completed" as const,
+        createdAt: new Date(Date.now() - (index + 1) * 60_000),
+        updatedAt: new Date(Date.now() - (index + 1) * 60_000),
+      })),
+    );
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    // No 4th assignment/wake — the cap is respected.
+    expect(result.orphanBlockersAssigned).toBe(0);
+
+    const allWakeups = await db
+      .select()
+      .from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, creatorAgentId));
+    const recoveryWakes = allWakeups.filter(
+      (wakeup) => (wakeup.payload as Record<string, unknown> | null)?.mutation === "unassigned_blocker_recovery",
+    );
+    expect(recoveryWakes).toHaveLength(priorWakeCount);
+
+    // Escalated for human handling, not re-assigned to the creator.
+    const blocker = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, blockerIssueId))
+      .then((rows) => rows[0] ?? null);
+    expect(blocker?.assigneeAgentId).toBeNull();
+
+    const escalationComments = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, blockerIssueId))
+      .then((rows) => rows.filter((row) => (row.body ?? "").includes("Orphan Blocker Recovery Exhausted")));
+    expect(escalationComments).toHaveLength(1);
+
+    // Idempotent: a second reconcile pass does not add another escalation comment or wake.
+    await heartbeat.reconcileStrandedAssignedIssues();
+    const afterSecondPass = await db
+      .select()
+      .from(issueComments)
+      .where(eq(issueComments.issueId, blockerIssueId))
+      .then((rows) => rows.filter((row) => (row.body ?? "").includes("Orphan Blocker Recovery Exhausted")));
+    expect(afterSecondPass).toHaveLength(1);
   });
 
   it("re-enqueues continuation for stranded in-progress work with no active run", async () => {
