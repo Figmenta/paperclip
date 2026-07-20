@@ -845,11 +845,24 @@ function shouldImplicitlyMoveCommentedIssueToTodo(input: {
   issueStatus: string | null | undefined;
   assigneeAgentId: string | null | undefined;
   actorType: "agent" | "user";
+  actorSource: string | null | undefined;
   actorId: string;
   actorRunId: string | null | undefined;
   checkoutRunId: string | null | undefined;
   executionRunId: string | null | undefined;
 }) {
+  // A board API key is a system actor, not an interactive human. getActorInfo()
+  // normalizes every non-agent caller — including board_key — to actorType
+  // "user", but a board-key POST is a service caller (e.g. Orchestra's
+  // server-side result mirror posting the deliverable comment on the just-closed
+  // mirror Issue). A system-owned result comment on a terminal issue must be
+  // inert: it carries the deliverable, it does not implicitly reopen or re-wake
+  // the finished assignee. Explicit lifecycle intent still works — a board_key
+  // caller that genuinely wants a reopen passes reopen/resume, which flows
+  // through the separate explicitMoveToTodoRequested branch and is unaffected
+  // by this guard. FIG-276: without this, every terminal Orchestra result
+  // re-opened and re-ran its assignee (the FIG-275 reproduction).
+  if (input.actorSource === "board_key") return false;
   // Local-CLI agents post comments under user auth, so the actor.type is "user"
   // even though the comment originates from the same heartbeat run that owns
   // the issue lock. Without this guard, an agent that closes its own issue and
@@ -876,8 +889,14 @@ function shouldHumanCommentResumeInProgressScheduledRetry(input: {
   issueStatus: string | null | undefined;
   assigneeAgentId: string | null | undefined;
   actorType: "agent" | "user";
+  actorSource: string | null | undefined;
 }) {
   if (!input.hasComment) return false;
+  // Superseding a scheduled retry is a human-operator affordance ("I added the
+  // missing detail; please continue"). A board_key caller is a system actor
+  // normalized to actorType "user" (see shouldImplicitlyMoveCommentedIssueToTodo)
+  // and must not trip it. FIG-276.
+  if (input.actorSource === "board_key") return false;
   if (input.actorType !== "user") return false;
   if (input.issueStatus !== "in_progress") return false;
   return typeof input.assigneeAgentId === "string" && input.assigneeAgentId.length > 0;
@@ -5791,6 +5810,7 @@ export function issueRoutes(
         issueStatus: existing.status,
         assigneeAgentId: requestedAssigneeAgentId,
         actorType: actor.actorType,
+        actorSource: actor.actorSource,
       })
         ? await svc.getCurrentScheduledRetry(existing.id)
         : null;
@@ -5813,6 +5833,7 @@ export function issueRoutes(
             issueStatus: existing.status,
             assigneeAgentId: requestedAssigneeAgentId,
             actorType: actor.actorType,
+            actorSource: actor.actorSource,
             actorId: actor.actorId,
             actorRunId: actor.runId,
             checkoutRunId: existing.checkoutRunId,
@@ -7608,6 +7629,7 @@ export function issueRoutes(
         issueStatus: issue.status,
         assigneeAgentId: issue.assigneeAgentId,
         actorType: actor.actorType,
+        actorSource: actor.actorSource,
       })
         ? await svc.getCurrentScheduledRetry(issue.id)
         : null;
@@ -7629,6 +7651,7 @@ export function issueRoutes(
           issueStatus: issue.status,
           assigneeAgentId: issue.assigneeAgentId,
           actorType: actor.actorType,
+          actorSource: actor.actorSource,
           actorId: actor.actorId,
           actorRunId: actor.runId,
           checkoutRunId: issue.checkoutRunId,
