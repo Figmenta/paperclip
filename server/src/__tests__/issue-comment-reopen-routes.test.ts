@@ -1335,6 +1335,101 @@ describe.sequential("issue comment reopen routes", () => {
     );
   });
 
+  // FIG-276: Orchestra posts its terminal deliverable as a board-key comment on
+  // the just-closed mirror Issue. getActorInfo() normalizes board_key to
+  // actorType "user", but a system result mirror must be inert: the comment is
+  // retained, the issue stays terminal, and the finished assignee is NOT woken.
+  it("does not reopen or wake when a board_key actor posts a deliverable comment on a done issue", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("done"));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue("done"),
+      ...patch,
+    }));
+
+    const res = await request(await installActor(createApp(), {
+      type: "board",
+      userId: "orchestra-board",
+      companyIds: ["company-1"],
+      source: "board_key",
+      isInstanceAdmin: false,
+    }))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "PR #430 delivered; scheduler fire-to-run wired. /tasks/xyz" });
+
+    expect(res.status).toBe(201);
+    // Deliverable retained.
+    expect(mockIssueService.addComment).toHaveBeenCalled();
+    // Issue stays terminal — no implicit reopen.
+    expect(mockIssueService.update).not.toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({ status: "todo" }),
+    );
+    // No assignee wake of any kind (skipWake is true for a terminal issue).
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+  });
+
+  // Same guard on the PATCH comment path.
+  it("does not reopen when a board_key actor posts a deliverable comment on a done issue via PATCH", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("done"));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue("done"),
+      ...patch,
+    }));
+
+    const res = await request(await installActor(createApp(), {
+      type: "board",
+      userId: "orchestra-board",
+      companyIds: ["company-1"],
+      source: "board_key",
+      isInstanceAdmin: false,
+    }))
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({ comment: "PR #430 delivered; scheduler fire-to-run wired." });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).not.toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      expect.objectContaining({ status: "todo" }),
+    );
+    expect(mockLogActivity).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        action: "issue.updated",
+        details: expect.objectContaining({ reopened: true }),
+      }),
+    );
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ reason: "issue_reopened_via_comment" }),
+    );
+  });
+
+  // The guard is scoped to the IMPLICIT path only: a board_key caller that
+  // passes explicit reopen intent still reopens (explicitMoveToTodoRequested).
+  it("still reopens a done issue when a board_key actor passes explicit reopen=true", async () => {
+    mockIssueService.getById.mockResolvedValue(makeIssue("done"));
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...makeIssue("done"),
+      ...patch,
+    }));
+
+    const res = await request(await installActor(createApp(), {
+      type: "board",
+      userId: "orchestra-board",
+      companyIds: ["company-1"],
+      source: "board_key",
+      isInstanceAdmin: false,
+    }))
+      .post("/api/issues/11111111-1111-4111-8111-111111111111/comments")
+      .send({ body: "Re-opening on purpose.", reopen: true });
+
+    expect(res.status).toBe(201);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      "11111111-1111-4111-8111-111111111111",
+      { status: "todo" },
+    );
+  });
+
   it("rejects non-assignee agent PATCH comments on closed issues", async () => {
     mockIssueService.getById.mockResolvedValue(makeIssue("done"));
     mockIssueService.addComment.mockResolvedValue({
