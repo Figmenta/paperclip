@@ -4664,6 +4664,9 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     finding: IssueLivenessFinding,
     issue: typeof issues.$inferSelect,
   ) {
+    // FIG kill switch (fig/v2026.626.0-r2): with recovery-owner resolution disabled,
+    // every escalation parks on the board instead of waking an LLM executor.
+    if (process.env.PAPERCLIP_RECOVERY_OWNER_DISABLED === "1") return null;
     const detailedCandidates = finding.recommendedOwnerCandidates.length > 0
       ? finding.recommendedOwnerCandidates
       : finding.recommendedOwnerCandidateAgentIds.map((agentId) => ({
