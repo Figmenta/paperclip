@@ -1700,6 +1700,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     runningAgent: typeof agents.$inferSelect;
     sourceIssue: typeof issues.$inferSelect | null;
   }) {
+    // FIG kill switch (fig/v2026.626.0-r2): see resolveStrandedIssueRecoveryOwnerAgentId.
+    if (process.env.PAPERCLIP_RECOVERY_OWNER_DISABLED === "1") return null;
     const candidateIds: string[] = [];
     if (input.sourceIssue?.assigneeAgentId) {
       const sourceAssignee = await getAgent(input.sourceIssue.assigneeAgentId);
@@ -2415,6 +2417,13 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     issue: typeof issues.$inferSelect,
     preferredOwnerAgentId?: string | null,
   ) {
+    // FIG kill switch (fig/v2026.626.0-r2, incident 2026-07-23): with recovery-owner
+    // resolution disabled, every escalation parks on the board (ownerType=board, no
+    // agent wake, no reassignment) instead of waking an LLM executor.
+    // Ported to v2026.722.0: upstream added the `preferredOwnerAgentId` parameter,
+    // so the signature is upstream's; the guard stays the first statement, which is
+    // what makes it unconditional — it precedes the preferred-owner candidate too.
+    if (process.env.PAPERCLIP_RECOVERY_OWNER_DISABLED === "1") return null;
     const candidateIds: string[] = [];
     if (preferredOwnerAgentId) candidateIds.push(preferredOwnerAgentId);
     if (issue.assigneeAgentId) {
