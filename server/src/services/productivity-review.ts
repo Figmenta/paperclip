@@ -523,6 +523,9 @@ export function productivityReviewService(db: Db, deps?: { enqueueWakeup?: Enque
   }
 
   async function resolveReviewOwnerAgentId(sourceIssue: IssueRow, sourceAgent: AgentRow) {
+    // FIG kill switch (fig/v2026.626.0-r2): with recovery-owner resolution disabled,
+    // every productivity review parks on the board instead of waking a reviewer agent.
+    if (process.env.PAPERCLIP_RECOVERY_OWNER_DISABLED === "1") return null;
     const candidateIds: string[] = [];
     if (sourceAgent.reportsTo) candidateIds.push(sourceAgent.reportsTo);
     if (sourceIssue.createdByAgentId) candidateIds.push(sourceIssue.createdByAgentId);
