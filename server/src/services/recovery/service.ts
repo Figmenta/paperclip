@@ -1454,6 +1454,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     runningAgent: typeof agents.$inferSelect;
     sourceIssue: typeof issues.$inferSelect | null;
   }) {
+    // FIG kill switch (fig/v2026.626.0-r2): see resolveStrandedIssueRecoveryOwnerAgentId.
+    if (process.env.PAPERCLIP_RECOVERY_OWNER_DISABLED === "1") return null;
     const candidateIds: string[] = [];
     if (input.sourceIssue?.assigneeAgentId) {
       const sourceAssignee = await getAgent(input.sourceIssue.assigneeAgentId);
@@ -2145,6 +2147,10 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
   }
 
   async function resolveStrandedIssueRecoveryOwnerAgentId(issue: typeof issues.$inferSelect) {
+    // FIG kill switch (fig/v2026.626.0-r2, incident 2026-07-23): with recovery-owner
+    // resolution disabled, every escalation parks on the board (ownerType=board, no
+    // agent wake, no reassignment) instead of waking an LLM executor.
+    if (process.env.PAPERCLIP_RECOVERY_OWNER_DISABLED === "1") return null;
     const candidateIds: string[] = [];
     if (issue.assigneeAgentId) {
       const assignee = await getAgent(issue.assigneeAgentId);
