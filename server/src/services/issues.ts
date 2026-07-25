@@ -10,8 +10,11 @@ import {
   assets,
   companies,
   companyMemberships,
+  costEvents,
   documentRevisions,
   documents,
+  feedbackVotes,
+  financeEvents,
   goals,
   heartbeatRuns,
   executionWorkspaces,
@@ -5506,6 +5509,40 @@ export function issueService(db: Db) {
           .select({ documentId: issueDocuments.documentId })
           .from(issueDocuments)
           .where(eq(issueDocuments.issueId, id));
+
+        // FIG-380: most tables pointing at issues.id are ON DELETE CASCADE or SET NULL, but a
+        // handful are NO ACTION — Postgres rejects the whole delete unless they are cleared
+        // here first, which is why DELETE /api/issues/:id 500'd for any issue with a comment.
+        // Two deliberate semantics: DETACH rows that outlive the issue, DELETE rows that are
+        // meaningless without it. A newly added NO ACTION FK on issues.id fails
+        // issue-delete-fk-coverage.test.ts rather than production — keep the two in sync.
+
+        // Detach: cost/finance are append-only ledgers. An issue delete must not erase spend
+        // history, and both columns are nullable, so drop the link and keep the row.
+        await tx.update(costEvents).set({ issueId: null }).where(eq(costEvents.issueId, id));
+        await tx.update(financeEvents).set({ issueId: null }).where(eq(financeEvents.issueId, id));
+
+        // Detach: splice this node out of the issue tree instead of orphaning or cascading —
+        // direct children re-attach to its parent (null parent = they become roots). Deleting
+        // a whole subtree from a single DELETE would destroy issues the caller never named.
+        const parentOfRemoved = await tx
+          .select({ parentId: issues.parentId })
+          .from(issues)
+          .where(eq(issues.id, id))
+          .then((rows) => rows[0]?.parentId ?? null);
+        await tx
+          .update(issues)
+          .set({ parentId: parentOfRemoved, updatedAt: new Date() })
+          .where(eq(issues.parentId, id));
+
+        // Delete: thread state that has no meaning once the issue is gone. Interactions before
+        // comments (interactions.comment_id -> issue_comments is SET NULL, so the reverse order
+        // just does needless work).
+        await tx.delete(feedbackVotes).where(eq(feedbackVotes.issueId, id));
+        await tx.delete(issueReadStates).where(eq(issueReadStates.issueId, id));
+        await tx.delete(issueInboxArchives).where(eq(issueInboxArchives.issueId, id));
+        await tx.delete(issueThreadInteractions).where(eq(issueThreadInteractions.issueId, id));
+        await tx.delete(issueComments).where(eq(issueComments.issueId, id));
 
         const removedIssue = await tx
           .delete(issues)
