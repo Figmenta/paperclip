@@ -249,6 +249,12 @@ const DETACHED_PROCESS_ERROR_CODE = "process_detached";
 // Default-disabled in the reaper (0) and switched on explicitly by the prod call
 // sites, mirroring the `staleThresholdMs` precedent so unit fixtures are unaffected.
 const REAP_HARD_TTL_MS = 30 * 60 * 1000;
+// FIG (2026-07-25): the backstop must never preempt an agent's OWN timeout. That one
+// ends the run gracefully and reports why on the issue; this one finalizes it from
+// outside, discarding live work. An agent that declares `adapterConfig.timeoutSec`
+// gets its full budget plus this grace before the backstop applies; one that declares
+// none keeps REAP_HARD_TTL_MS unchanged.
+const HARD_TTL_AGENT_GRACE_MS = 5 * 60 * 1000;
 const HARD_TTL_REAP_ERROR_CODE = "process_hard_ttl_reaped";
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
@@ -8132,7 +8138,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       // Past the ceiling an in-memory entry is almost certainly a leak and a live
       // pid almost certainly a reuse, so neither may keep a dead run pinned at
       // `running`/`null` liveness holding an issue checkout (FIG-131).
-      if (hardTtlMs > 0) {
+      // Per-run ceiling: never shorter than what the agent was promised (see
+      // HARD_TTL_AGENT_GRACE_MS). A run killed by this backstop loses its work, so it
+      // must only ever catch a run the agent's own timeout did NOT already end.
+      const declaredTimeoutMs = (() => {
+        const cfg = adapterConfig as Record<string, unknown> | null;
+        const secs = cfg && typeof cfg.timeoutSec === "number" ? cfg.timeoutSec : 0;
+        return secs > 0 ? secs * 1000 : 0;
+      })();
+      const effectiveTtlMs =
+        declaredTimeoutMs > 0
+          ? Math.max(hardTtlMs, declaredTimeoutMs + HARD_TTL_AGENT_GRACE_MS)
+          : hardTtlMs;
+      if (effectiveTtlMs > 0) {
         const freshnessTs = Math.max(
           run.lastOutputAt ? new Date(run.lastOutputAt).getTime() : 0,
           run.lastUsefulActionAt ? new Date(run.lastUsefulActionAt).getTime() : 0,
@@ -8140,11 +8158,11 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           run.startedAt ? new Date(run.startedAt).getTime() : 0,
         );
         const ageMs = freshnessTs > 0 ? now.getTime() - freshnessTs : Number.POSITIVE_INFINITY;
-        if (ageMs > hardTtlMs) {
+        if (ageMs > effectiveTtlMs) {
           const inMemoryHandle = runningProcesses.has(run.id) || activeRunExecutions.has(run.id);
           const ageLabel = Number.isFinite(ageMs) ? `${Math.round(ageMs / 60_000)}m` : "unknown age";
           const hardTtlMessage =
-            `Run exceeded hard TTL (${ageLabel}, ceiling ${Math.round(hardTtlMs / 60_000)}m) while still \`running\`; ` +
+            `Run exceeded hard TTL (${ageLabel}, ceiling ${Math.round(effectiveTtlMs / 60_000)}m) while still \`running\`; ` +
             `finalized regardless of in-memory handle (${inMemoryHandle ? "present" : "absent"}) or ` +
             `recorded pid ${run.processPid ?? "none"} (assumed recycled past the ceiling).`;
           let finalizedRun = await setRunStatus(run.id, "failed", {
@@ -8191,7 +8209,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             message: hardTtlMessage,
             payload: {
               hardTtlReaped: true,
-              hardTtlMs,
+              hardTtlMs: effectiveTtlMs,
               ...(Number.isFinite(ageMs) ? { ageMs } : {}),
               inMemoryHandle,
               ...(run.processPid ? { processPid: run.processPid } : {}),
