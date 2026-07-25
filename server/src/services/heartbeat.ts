@@ -72,6 +72,11 @@ import { logger } from "../middleware/logger.js";
 import { publishLiveEvent } from "./live-events.js";
 import { normalizeResponsibleUserDenialCode } from "./responsible-user-denial-run-outcomes.js";
 import { getRunLogStore, type RunLogHandle } from "./run-log-store.js";
+import {
+  materializeIssueImageAttachments,
+  appendImageAttachmentSection,
+  figCoderImageAttachmentsEnabled,
+} from "./fig/coder-image-attachments.js";
 import { getServerAdapter, listAdapterModelProfiles, runningProcesses } from "../adapters/index.js";
 import type {
   AdapterExecutionResult,
@@ -12923,6 +12928,34 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ]
         : []),
     ];
+    // FIG (canale allegati B): surface operator screenshots to the local coder,
+    // which is multimodal via the filesystem (reads images with the Read tool),
+    // not via content-block. Copies the issue's image attachments into the
+    // execution workspace and references them in the task prompt. Best-effort,
+    // env-gated (PAPERCLIP_FIG_CODER_IMAGE_ATTACHMENTS=0 disables). Upstream
+    // v2026.707.0 is text-only; carried until upstream ships an equivalent.
+    if (figCoderImageAttachmentsEnabled() && issueRef?.id) {
+      try {
+        const figImagePaths = await materializeIssueImageAttachments({
+          db,
+          companyId: agent.companyId,
+          issueId: issueRef.id,
+          cwd: executionWorkspace.cwd,
+        });
+        if (figImagePaths.length > 0) {
+          context.paperclipTaskMarkdown = appendImageAttachmentSection(
+            typeof context.paperclipTaskMarkdown === "string" ? context.paperclipTaskMarkdown : null,
+            figImagePaths,
+          );
+        }
+      } catch (figError) {
+        logger.warn(
+          { err: figError, issueId: issueRef.id },
+          "fig: image attachment materialization failed (non-fatal)",
+        );
+      }
+    }
+
     context.paperclipWorkspace = {
       cwd: executionWorkspace.cwd,
       source: executionWorkspace.source,
