@@ -94,6 +94,29 @@ describe("successful run handoff decision", () => {
     expect(decision.instruction).toContain("record an explicit continuation path");
   });
 
+  // FIG-427: the instruction ships in payload.instruction and contextSnapshot on every
+  // finish_successful_run_handoff wake, so it is the guidance the agent acts on. It must name
+  // exactly the review paths the guard accepts: an instruction that told the agent to open a
+  // pending interaction would be obeyed, refused with 422, and would burn a counted handoff
+  // attempt until the issue escalated to blocked.
+  it("names the review paths the in_review guard accepts, and no retired one", () => {
+    const decision = decide();
+    expect(decision.kind).toBe("enqueue");
+    if (decision.kind !== "enqueue") return;
+    expect(decision.instruction).toContain("designated third-party reviewer");
+    expect(decision.instruction).toContain("assigneeAgentId");
+    expect(decision.instruction).toContain("assigneeUserId");
+    expect(decision.instruction).toContain("executionState.currentParticipant");
+    // The retired paths may only appear as refused, never as something to go and create.
+    expect(decision.instruction).toContain(
+      "A pending issue-thread interaction, a linked pending approval or a scheduled monitor does not designate a reviewer",
+    );
+    expect(decision.instruction).not.toContain("a real reviewer path");
+    // The wake carries the instruction twice; both copies must be the corrected one.
+    expect(String((decision.payload as any).instruction)).toContain("assigneeAgentId");
+    expect(String((decision.contextSnapshot as any).instruction)).toContain("assigneeAgentId");
+  });
+
   it("does not queue when the issue already has a valid disposition", () => {
     expect(decide({ issue: { ...issue, status: "done" } as any })).toEqual({
       kind: "skip",
