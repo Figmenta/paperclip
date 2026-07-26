@@ -119,7 +119,9 @@ type TestActor =
     }
   | {
       type: "agent";
-      agentId: string;
+      // Nullable: an agent actor whose id never resolved is a real shape at this layer, and the
+      // in_review guard has to fail closed on it (FIG-427).
+      agentId: string | null;
       companyId: string;
       runId: string | null;
     };
@@ -258,6 +260,55 @@ describe("issue execution policy routes", () => {
       missing: "third_party_reviewer",
       resultingAssignee: "none",
     });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  // The third-party path is read off an identity comparison, so it fails CLOSED when the caller's
+  // own id is unusable: without it we cannot tell a third-party reviewer from the agent keeping its
+  // own issue. This is the branch that produces `resultingAssignee: "unverifiable_agent"`, and it is
+  // the easiest term to drop by accident in a later refactor of
+  // `assigneeAgentId.length > 0 && callerAgentId.length > 0 && assigneeAgentId !== callerAgentId`:
+  // remove the caller-id term and an unidentifiable caller silently starts passing the guard.
+  it("refuses an in_review transition when the calling agent id is unusable, even with a third-party assignee", async () => {
+    const blankCaller = "   ";
+    const issue = selfRetainedIssue({
+      assigneeAgentId: blankCaller,
+      identifier: "PAP-1012",
+      title: "Unverifiable caller",
+    });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockUpdatePassthrough(issue);
+    // Reassigning needs the tasks:assign grant; without it the request 403s on permissions
+    // before the guard is reached.
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({ ...callerActor(), agentId: blankCaller }))
+      .patch(`/api/issues/${ISSUE_ID}`)
+      .send({ status: "in_review", assigneeAgentId: OTHER_AGENT });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "invalid_issue_disposition",
+      missing: "third_party_reviewer",
+      resultingAssignee: "unverifiable_agent",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  // The other shape of an unknown caller — no agent id at all — never reaches the reviewer guard:
+  // the agent mutation gate refuses it first. Asserted here so the end-to-end claim "an unknown
+  // caller can never move an issue to in_review" stays covered even though the 422 above is not
+  // the code that enforces it.
+  it("refuses an in_review transition from an agent actor with no agent id, before the reviewer guard", async () => {
+    const issue = selfRetainedIssue({ assigneeAgentId: OTHER_AGENT, identifier: "PAP-1013" });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockUpdatePassthrough(issue);
+
+    const res = await request(await createApp({ ...callerActor(), agentId: null }))
+      .patch(`/api/issues/${ISSUE_ID}`)
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(403);
     expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
