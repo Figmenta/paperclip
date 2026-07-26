@@ -507,17 +507,6 @@ function hasExecutionParticipant(value: unknown) {
   return false;
 }
 
-function hasScheduledMonitor(input: {
-  existingMonitorNextCheckAt?: Date | null;
-  patchMonitorNextCheckAt?: unknown;
-  executionPolicy?: unknown;
-}) {
-  if (input.patchMonitorNextCheckAt instanceof Date && !Number.isNaN(input.patchMonitorNextCheckAt.getTime())) return true;
-  if (input.patchMonitorNextCheckAt === undefined && input.existingMonitorNextCheckAt) return true;
-  const policy = normalizeIssueExecutionPolicy(input.executionPolicy ?? null);
-  return Boolean(policy?.monitor?.nextCheckAt);
-}
-
 function successfulRunHandoffStateFromActivity(row: {
   action: string;
   agentId: string | null;
@@ -640,14 +629,14 @@ function withRecoveryActionsOnRelationSummaries(
   };
 }
 
-const ACTIVE_REVIEW_APPROVAL_STATUSES = new Set(["pending", "revision_requested"]);
-
 const INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE =
-  "invalid_issue_disposition: Agent-authored updates that move an issue to in_review must include a real review path. " +
-  "This request would leave the issue in_review without anyone or anything owning the next action. " +
-  "Keep working instead of moving to review, create a request_confirmation or ask_user_questions interaction, " +
-  "link or request a pending approval, assign a human reviewer with assigneeUserId, set a typed executionState.currentParticipant through an execution policy, " +
-  "or schedule an issue monitor for an external review/check. After creating one of those review paths, retry the status update.";
+  "invalid_issue_disposition: in_review requires a designated third-party reviewer. " +
+  "This request would leave the issue in_review with the calling agent still holding it, or with nobody holding it: " +
+  "nobody gets woken, so it is not a waiting state, it is a dead end that looks like progress. " +
+  "Do one of these and retry: assign the issue to another agent with assigneeAgentId, " +
+  "assign it to a human reviewer with assigneeUserId, " +
+  "set a typed executionState.currentParticipant through an execution policy stage, " +
+  "or give the issue its real disposition instead of review (done, or blocked with a named blocker and unblock owner).";
 
 function executionPrincipalsEqual(
   left: ParsedExecutionState["currentParticipant"] | null,
@@ -1737,55 +1726,75 @@ export function issueRoutes(
     );
   }
 
-  async function assertAgentInReviewReviewPath(input: {
+  // in_review is a waiting state, and something only waits when a THIRD PARTY owns the
+  // next action. An agent that moves its own issue to in_review and keeps it designates
+  // nobody: no wake fires, no reviewer is bound, and the issue stalls forever while
+  // looking like progress. Measured on 2026-07-26: twelve issues stuck in in_review, the
+  // oldest for ~325 hours. The rule already existed in the agent canon and was ignored,
+  // so the server refuses the move instead of advising against it.
+  //
+  // Deliberately NOT accepted as a substitute for a designated reviewer: a pending thread
+  // interaction, a linked pending approval, or a scheduled monitor. Those are real
+  // continuation paths, but none of them designates a reviewer, and empirically they were
+  // the leak: 4 of the 12 stuck issues were self-retained behind a pending
+  // request_confirmation nobody ever answered. An agent waiting on a human answer assigns
+  // the issue to that human (assigneeUserId); an agent waiting on an external check keeps
+  // the issue in_progress with its monitor. Neither needs to park it in review.
+  function assertAgentInReviewReviewPath(input: {
     existing: {
       id: string;
       companyId: string;
       status: string;
+      assigneeAgentId?: string | null;
       assigneeUserId?: string | null;
       executionState?: unknown;
-      monitorNextCheckAt?: Date | null;
     };
     updateFields: Record<string, unknown>;
     actorType: string;
+    actorAgentId?: string | null;
   }) {
     const nextStatus = typeof input.updateFields.status === "string"
       ? input.updateFields.status
       : input.existing.status;
+    // Human and board actors are out of scope: a person moving something to review is not
+    // the dead end being closed, and the board must stay able to repair stuck issues.
     if (input.actorType !== "agent" || input.existing.status === "in_review" || nextStatus !== "in_review") return;
 
-    const nextAssigneeUserId = input.updateFields.assigneeUserId === undefined
-      ? input.existing.assigneeUserId
-      : input.updateFields.assigneeUserId;
-    if (typeof nextAssigneeUserId === "string" && nextAssigneeUserId.trim().length > 0) return;
-
+    // 1. An execution policy stage that designates a participant already owns the review and
+    //    is protected by its own stage guard. That path stays legitimate even when the
+    //    resulting assignee is the calling agent: the stage, not the assignee, is the binding.
     const nextExecutionState = input.updateFields.executionState === undefined
       ? input.existing.executionState
       : input.updateFields.executionState;
     if (hasExecutionParticipant(nextExecutionState)) return;
 
-    const nextExecutionPolicy = input.updateFields.executionPolicy;
-    if (hasScheduledMonitor({
-      existingMonitorNextCheckAt: input.existing.monitorNextCheckAt ?? null,
-      patchMonitorNextCheckAt: input.updateFields.monitorNextCheckAt,
-      executionPolicy: nextExecutionPolicy,
-    })) return;
+    // 2. A human reviewer.
+    const nextAssigneeUserId = input.updateFields.assigneeUserId === undefined
+      ? input.existing.assigneeUserId
+      : input.updateFields.assigneeUserId;
+    if (typeof nextAssigneeUserId === "string" && nextAssigneeUserId.trim().length > 0) return;
 
-    const interactions = await issueThreadInteractionService(db).listForIssue(input.existing.id);
-    if (interactions.some((interaction) => interaction.status === "pending")) return;
-
-    const approvals = await issueApprovalsSvc.listApprovalsForIssue(input.existing.id);
-    if (approvals.some((approval) => ACTIVE_REVIEW_APPROVAL_STATUSES.has(String(approval.status)))) return;
+    // 3. Another agent as reviewer. This is the behaviour we want to encourage, so it is
+    //    read off the RESULTING assignee (after any assignee patch and stage transition).
+    //    Fails closed when the caller's own agent id is unknown: without it we cannot tell
+    //    a third-party reviewer from the agent keeping its own issue.
+    const nextAssigneeAgentId = input.updateFields.assigneeAgentId === undefined
+      ? input.existing.assigneeAgentId
+      : input.updateFields.assigneeAgentId;
+    const assigneeAgentId = typeof nextAssigneeAgentId === "string" ? nextAssigneeAgentId.trim() : "";
+    const callerAgentId = typeof input.actorAgentId === "string" ? input.actorAgentId.trim() : "";
+    if (assigneeAgentId.length > 0 && callerAgentId.length > 0 && assigneeAgentId !== callerAgentId) return;
 
     throw unprocessable(INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE, {
       code: "invalid_issue_disposition",
-      missing: "review_path",
+      missing: "third_party_reviewer",
+      resultingAssignee: assigneeAgentId.length > 0
+        ? (assigneeAgentId === callerAgentId ? "calling_agent" : "unverifiable_agent")
+        : "none",
       validReviewPaths: [
-        "pending_issue_thread_interaction",
-        "linked_pending_approval",
+        "third_party_assignee_agent_id",
         "human_assignee_user_id",
         "typed_execution_state_current_participant",
-        "scheduled_issue_monitor",
       ],
     });
   }
@@ -3678,10 +3687,11 @@ export function issueRoutes(
 
     const actor = getActorInfo(req);
     const updateFields = sourceIssueStatus ? { status: sourceIssueStatus } : {};
-    await assertAgentInReviewReviewPath({
+    assertAgentInReviewReviewPath({
       existing,
       updateFields,
       actorType: req.actor.type,
+      actorAgentId: req.actor.type === "agent" ? req.actor.agentId ?? null : null,
     });
 
     const actionStatus = outcome === "cancelled" ? "cancelled" : "resolved";
@@ -5996,10 +6006,11 @@ export function issueRoutes(
       }
     }
 
-    await assertAgentInReviewReviewPath({
+    assertAgentInReviewReviewPath({
       existing,
       updateFields,
       actorType: req.actor.type,
+      actorAgentId: req.actor.type === "agent" ? req.actor.agentId ?? null : null,
     });
 
     const nextAssigneeAgentId =
