@@ -201,6 +201,98 @@ test("an approved, mergeable PR that never merges is reported", () => {
   assert.equal(findings[0].ageMinutes, 90, "aged from the approval, not from the comment");
 });
 
+test("a red or still-running head is not a missing merge", () => {
+  const approvedOn = (checkRuns) =>
+    pull({
+      number: 601,
+      checkRuns,
+      reviews: [{ reviewer: "griso", state: "APPROVED", commitSha: "a".repeat(40), submittedAtMs: ago(90) }],
+    });
+
+  // Still running: the merge has not failed to start, it cannot start yet.
+  assert.deepEqual(
+    evaluate(snapshot({ openPulls: [approvedOn([{ name: "ci", status: "in_progress", startedAtMs: ago(50) }])] }))
+      .findings.filter((f) => f.condition === "approved_not_merged"),
+    [],
+  );
+
+  // Red: a failing check is itself a loud event, and someone owes work on it.
+  assert.deepEqual(
+    evaluate(
+      snapshot({
+        openPulls: [
+          approvedOn([{ name: "ci", status: "completed", conclusion: "failure", startedAtMs: ago(50) }]),
+        ],
+      }),
+    ).findings.filter((f) => f.condition === "approved_not_merged"),
+    [],
+  );
+
+  // Green, approved, past the threshold, still open: that is the real thing.
+  const green = evaluate(
+    snapshot({
+      openPulls: [
+        approvedOn([
+          { name: "ci", status: "completed", conclusion: "success", startedAtMs: ago(80) },
+          { name: "smoke", status: "completed", conclusion: "skipped", startedAtMs: ago(80) },
+        ]),
+      ],
+    }),
+  ).findings;
+  assert.equal(green.length, 1);
+  assert.equal(green[0].condition, "approved_not_merged");
+
+  // A repository with no CI at all behaves as it did before.
+  const noChecks = evaluate(snapshot({ openPulls: [approvedOn([])] })).findings;
+  assert.equal(noChecks.length, 1);
+  assert.equal(noChecks[0].condition, "approved_not_merged");
+});
+
+test("a renewal buried behind a wall of bot reviews clears the finding", () => {
+  // The shape that a one-page read would get wrong: the reviews endpoint is
+  // oldest-first, so the stale approval leads and the renewal trails.
+  const noisy = pull550();
+  for (let index = 0; index < 120; index += 1) {
+    noisy.reviews.push({
+      reviewer: `bot-${index}`,
+      state: "COMMENTED",
+      commitSha: PR_550_HEAD,
+      submittedAtMs: ago(300 - index),
+    });
+  }
+  assert.equal(
+    evaluate(snapshot({ openPulls: [noisy] })).findings.filter((f) => f.condition === "stale_approval").length,
+    1,
+    "comments alone never renew an approval",
+  );
+
+  noisy.reviews.push({
+    reviewer: "griso",
+    state: "APPROVED",
+    commitSha: PR_550_HEAD,
+    submittedAtMs: ago(20),
+  });
+  assert.deepEqual(
+    evaluate(snapshot({ openPulls: [noisy] })).findings.filter((f) => f.condition === "stale_approval"),
+    [],
+    "the renewal must be seen even when it is the 122nd review",
+  );
+});
+
+test("an alert that reached nobody is not recorded as announced", () => {
+  const { findings } = evaluate(snapshot({ openPulls: [pull550()] }));
+  const first = diffFindings(findings, { findings: {} }, { nowMs: NOW });
+  assert.equal(first.alerts.length, 1);
+
+  // Delivery failed, so the shell rolls the ledger back the way main() does.
+  const rolledBack = { ...first.nextState, findings: { ...first.nextState.findings } };
+  for (const alert of first.alerts) delete rolledBack.findings[alert.fingerprint];
+
+  const retry = diffFindings(findings, rolledBack, { nowMs: NOW + 15 * MINUTE });
+  assert.equal(retry.alerts.length, 1, "an undelivered alert is spoken again");
+  assert.equal(retry.alerts[0].reason, "new");
+});
+
 test("requested changes are an ordinary loop-back, not silence", () => {
   const blocked = pull({
     reviews: [

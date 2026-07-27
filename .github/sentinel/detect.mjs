@@ -48,6 +48,33 @@ const BINDING_REVIEW_STATES = new Set(["APPROVED", "CHANGES_REQUESTED", "DISMISS
 /** Check-run states that mean "not finished". */
 const UNFINISHED_CHECK_STATES = new Set(["queued", "in_progress", "pending", "waiting", "requested"]);
 
+/** Check-run conclusions that mean the head is not going anywhere. */
+const FAILING_CHECK_CONCLUSIONS = new Set([
+  "failure",
+  "timed_out",
+  "cancelled",
+  "action_required",
+  "startup_failure",
+]);
+
+/**
+ * Whether the head is green enough that a merge could actually have started.
+ *
+ * A red or still-running head is not silence: a check failing is itself an
+ * event, loudly emitted, and somebody already owes work on it. Reporting it
+ * here would be the sentinel repeating what the system already said.
+ *
+ * A PR with no checks at all counts as ready, so a repository without CI
+ * behaves exactly as before.
+ */
+export function headIsMergeReady(pull) {
+  for (const run of pull.checkRuns ?? []) {
+    if (UNFINISHED_CHECK_STATES.has(run.status)) return false;
+    if (FAILING_CHECK_CONCLUSIONS.has(run.conclusion)) return false;
+  }
+  return true;
+}
+
 export function minutes(ms) {
   return Math.floor(ms / MINUTE_MS);
 }
@@ -115,6 +142,9 @@ function finding({ condition, subject, url, fingerprint, ageMs, thresholdMinutes
 /** 1. Approved on the current head, green enough to go, and still open. */
 export function detectApprovedNotMerged(pull, { nowMs, thresholds }) {
   if (pull.draft) return null;
+  // Still running, or red: an event already fired for that and someone owes
+  // work on it. Only a head that could have merged counts as a merge missing.
+  if (!headIsMergeReady(pull)) return null;
   const state = resolveApprovalState(pull.reviews, pull.headSha);
   if (state.changesRequested) return null;
   if (state.earliestApprovalOnHeadMs === null) return null;

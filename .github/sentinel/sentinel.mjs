@@ -71,8 +71,8 @@ class GitHub {
     this.token = token;
   }
 
-  async get(path) {
-    const response = await fetch(`${API}${path}`, {
+  async getPage(url) {
+    const response = await fetch(url, {
       headers: {
         accept: "application/vnd.github+json",
         authorization: `Bearer ${this.token}`,
@@ -81,9 +81,36 @@ class GitHub {
       },
     });
     if (!response.ok) {
-      throw new Error(`GET ${path} → ${response.status} ${(await response.text()).slice(0, 200)}`);
+      throw new Error(`GET ${url} → ${response.status} ${(await response.text()).slice(0, 200)}`);
     }
-    return response.json();
+    return { body: await response.json(), link: response.headers.get("link") };
+  }
+
+  async get(path) {
+    return (await this.getPage(`${API}${path}`)).body;
+  }
+
+  /**
+   * Walks `Link: rel="next"` to the end of a list.
+   *
+   * Reading one page is not good enough for reviews: that endpoint returns
+   * oldest-first, so page 1 of a busy PR holds the *stalest* reviews and the
+   * renewal that would clear a finding sits on page 2. Taking only the last
+   * page is equally wrong — a reviewer whose newest verdict is early would
+   * vanish. The whole list, or the answer is a guess.
+   *
+   * Costs nothing on a quiet repo: a second request happens only when GitHub
+   * actually advertises one.
+   */
+  async getAll(path, pick = (body) => body, maxPages = 20) {
+    let url = `${API}${path}`;
+    const items = [];
+    for (let page = 0; url && page < maxPages; page += 1) {
+      const { body, link } = await this.getPage(url);
+      items.push(...pick(body));
+      url = /<([^>]+)>;\s*rel="next"/.exec(link ?? "")?.[1] ?? null;
+    }
+    return items;
   }
 }
 
@@ -91,7 +118,7 @@ async function collectSnapshot(gh, repo, thresholds) {
   const errors = [];
   const nowMs = Date.now();
 
-  const rawOpen = await gh.get(`/repos/${repo}/pulls?state=open&per_page=100`);
+  const rawOpen = await gh.getAll(`/repos/${repo}/pulls?state=open&per_page=100`);
 
   const openPulls = await mapLimit(rawOpen, CONCURRENCY, async (pull) => {
     const base = {
@@ -107,7 +134,7 @@ async function collectSnapshot(gh, repo, thresholds) {
     };
 
     try {
-      const reviews = await gh.get(`/repos/${repo}/pulls/${pull.number}/reviews?per_page=100`);
+      const reviews = await gh.getAll(`/repos/${repo}/pulls/${pull.number}/reviews?per_page=100`);
       base.reviews = reviews.map((review) => ({
         reviewer: review.user?.login ?? "unknown",
         state: review.state,
@@ -119,10 +146,14 @@ async function collectSnapshot(gh, repo, thresholds) {
     }
 
     try {
-      const checks = await gh.get(`/repos/${repo}/commits/${pull.head.sha}/check-runs?per_page=100`);
-      base.checkRuns = (checks.check_runs ?? []).map((run) => ({
+      const checkRuns = await gh.getAll(
+        `/repos/${repo}/commits/${pull.head.sha}/check-runs?per_page=100`,
+        (body) => body.check_runs ?? [],
+      );
+      base.checkRuns = checkRuns.map((run) => ({
         name: run.name,
         status: run.status,
+        conclusion: run.conclusion,
         startedAtMs: ms(run.started_at) ?? ms(run.created_at),
       }));
     } catch (error) {
@@ -151,7 +182,7 @@ async function collectSnapshot(gh, repo, thresholds) {
     try {
       const closed = await gh.get(
         `/repos/${repo}/pulls?state=closed&sort=updated&direction=desc&per_page=50`,
-      );
+      );  // newest-first and lookback-bounded, so one page is the whole question
       mergedPulls = closed
         .filter((pull) => pull.merged_at)
         .map((pull) => ({
@@ -243,9 +274,20 @@ async function writeState(path, state) {
   await writeFile(path, `${JSON.stringify(state, null, 2)}\n`, "utf8");
 }
 
+/**
+ * A pull request title is attacker-controlled on a public repository, and it
+ * travels from here into a chat channel. Defang it at the boundary rather than
+ * in the detectors, which must stay presentation-agnostic.
+ */
+function neutralize(text) {
+  return String(text ?? "")
+    .replace(/[\r\n]+/g, " ")
+    .replace(/@(everyone|here)/gi, "@​$1");
+}
+
 function renderAlert(alert) {
   const banner = alert.reason === "worsened" ? "WORSENING" : "NEW";
-  return `- **[${banner}] ${alert.condition}** — ${alert.subject}\n  ${alert.detail}\n  ${alert.ageMinutes}m silent (threshold ${alert.thresholdMinutes}m, tier ${alert.tier})\n  ${alert.url ?? ""}`.trimEnd();
+  return `- **[${banner}] ${alert.condition}** — ${neutralize(alert.subject)}\n  ${neutralize(alert.detail)}\n  ${alert.ageMinutes}m silent (threshold ${alert.thresholdMinutes}m, tier ${alert.tier})\n  ${alert.url ?? ""}`.trimEnd();
 }
 
 function renderReport(repo, alerts) {
@@ -300,8 +342,13 @@ async function deliver(repo, alerts, dryRun) {
       const response = await fetch(discordUrl, {
         method: "POST",
         headers: { "content-type": "application/json" },
-        // Discord hard-caps a message at 2000 characters.
-        body: JSON.stringify({ content: report.slice(0, 1900) }),
+        body: JSON.stringify({
+          // Discord hard-caps a message at 2000 characters.
+          content: report.slice(0, 1900),
+          // Server-side authority over mentions: a PR title carried in this
+          // body must never be able to page the whole channel.
+          allowed_mentions: { parse: [] },
+        }),
       });
       if (!response.ok) throw new Error(`${response.status}`);
       delivered.push("discord");
@@ -350,6 +397,24 @@ async function main() {
     console.log(renderReport(repo, alerts));
     console.log(`delivered via: ${delivered.join(", ") || "nothing configured"}`);
     await summarize([`### Silence sentinel — ${alerts.length} announced`, "", ...alerts.map(renderAlert)]);
+
+    if (!dryRun && delivered.length === 0) {
+      // Nobody was told, so nothing may be recorded as told. Writing these
+      // fingerprints would mark the condition announced, the next scan would
+      // see an equal band and stay quiet, and the alert would be spoken
+      // exactly zero times — the sentinel failing the way it exists to catch.
+      // Roll back only the fingerprints that just failed to reach anyone;
+      // anything previously delivered keeps its band and stays silent.
+      for (const alert of alerts) {
+        const before = previous.findings?.[alert.fingerprint];
+        if (before) nextState.findings[alert.fingerprint] = before;
+        else delete nextState.findings[alert.fingerprint];
+      }
+      console.error(
+        `::error::${alerts.length} alert(s) reached no sink; not recorded as announced, will be retried next scan`,
+      );
+      process.exitCode = 1;
+    }
   } else {
     // The empty run is the common case and it says nothing anywhere.
     console.log("silence is clean: nothing new, nothing worsening");
