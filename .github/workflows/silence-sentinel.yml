@@ -1,0 +1,129 @@
+# Silence sentinel.
+#
+# Everything else in this repository listens: webhooks fire when something
+# happens. This one polls, because the failures that hurt are the ones where
+# nothing happens — a merge that never starts, an approval left behind by a
+# moving head, a deploy that never runs, a check that hangs. There is no event
+# for silence, so the only way to hear it is to go and look.
+#
+# Deterministic by design: plain GitHub REST reads and pure comparisons. No
+# model is consulted. This is a controller, not an agent.
+#
+# Nothing here is repository-specific: it scans ${{ github.repository }} and
+# reads every recipient from repository secrets/variables, so copying these two
+# files into another repo is the whole port.
+#
+# Note on scheduled runs in a fork: GitHub disables scheduled workflows in
+# forked repositories until Actions is enabled there, and auto-disables the
+# schedule on a public repository after 60 days without activity. The
+# workflow_dispatch trigger below is the manual path to prove it runs, and the
+# first scheduled fire after merge is worth confirming once.
+
+name: Silence Sentinel
+
+on:
+  schedule:
+    # Every 15 minutes. Actions cron is best-effort and can drift by several
+    # minutes under load, which is why no threshold is shorter than 30m.
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "owner/name to scan (defaults to this repository)"
+        required: false
+        type: string
+      dry_run:
+        description: "report to the log and deliver nothing"
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+  actions: read
+
+concurrency:
+  group: silence-sentinel-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    # A fork of this repository should not inherit our cron and start paging
+    # our channels.
+    if: github.repository_owner == 'Figmenta'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Self-test the detectors
+        # A broken detector must not be allowed to invent alerts, so the logic
+        # proves itself before it is trusted with a channel. The file is named
+        # explicitly: node --test skips dot-directories, so a directory
+        # argument here would silently run nothing.
+        run: node --test .github/sentinel/detect.test.mjs
+
+      - name: Restore alert ledger
+        # Anti-noise state. The Actions cache is the right home for it here:
+        # Issues are disabled on this repository so an issue-comment ledger is
+        # impossible, and artifacts would need a cross-run lookup plus retention
+        # management. Cache keys are immutable, hence the run-id key with a
+        # rolling restore-keys prefix. A missed restore costs at most one
+        # repeated alert — never a missed one.
+        uses: actions/cache/restore@v4
+        with:
+          path: .sentinel-state
+          key: silence-sentinel-state-${{ github.run_id }}
+          restore-keys: |
+            silence-sentinel-state-
+
+      - name: Scan for silence
+        env:
+          # Read scope for the scanned repo. A PAT is only needed to scan a
+          # repository other than this one.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SENTINEL_GITHUB_TOKEN: ${{ secrets.SENTINEL_GITHUB_TOKEN }}
+          SENTINEL_REPO: ${{ inputs.repo || github.repository }}
+          SENTINEL_DRY_RUN: ${{ inputs.dry_run || 'false' }}
+          SENTINEL_STATE_FILE: .sentinel-state/state.json
+
+          # Recipients. Referenced, never written: an unset value simply turns
+          # that sink off and the run says so in its log.
+          SENTINEL_PAPERCLIP_ISSUE_URL: ${{ vars.SENTINEL_PAPERCLIP_ISSUE_URL }}
+          SENTINEL_PAPERCLIP_TOKEN: ${{ secrets.SENTINEL_PAPERCLIP_TOKEN }}
+          SENTINEL_DISCORD_WEBHOOK_URL: ${{ secrets.SENTINEL_DISCORD_WEBHOOK_URL }}
+
+          # Deploy evidence. Unset on both counts means condition 3 stays off
+          # rather than reporting every merge as unserved.
+          SENTINEL_DEPLOY_WORKFLOW: ${{ vars.SENTINEL_DEPLOY_WORKFLOW }}
+          SENTINEL_DEPLOY_ENVIRONMENT: ${{ vars.SENTINEL_DEPLOY_ENVIRONMENT }}
+
+          # Director deadman: wired, and off until there is a dispatcher to ask.
+          SENTINEL_DIRECTOR_STATUS_URL: ${{ vars.SENTINEL_DIRECTOR_STATUS_URL }}
+
+          # Threshold overrides, all optional.
+          SENTINEL_APPROVED_NOT_MERGED_MINUTES: ${{ vars.SENTINEL_APPROVED_NOT_MERGED_MINUTES }}
+          SENTINEL_STALE_APPROVAL_MINUTES: ${{ vars.SENTINEL_STALE_APPROVAL_MINUTES }}
+          SENTINEL_MERGED_NOT_DEPLOYED_MINUTES: ${{ vars.SENTINEL_MERGED_NOT_DEPLOYED_MINUTES }}
+          SENTINEL_CI_STUCK_MINUTES: ${{ vars.SENTINEL_CI_STUCK_MINUTES }}
+          SENTINEL_DIRECTOR_IDLE_MINUTES: ${{ vars.SENTINEL_DIRECTOR_IDLE_MINUTES }}
+        run: node .github/sentinel/sentinel.mjs
+
+      - name: Persist alert ledger
+        # success() and not always(): a scan that failed, or whose alerts
+        # reached no sink, must not advance the ledger — otherwise the thing it
+        # found is filed as "announced" and never spoken again.
+        if: ${{ success() && inputs.dry_run != true }}
+        uses: actions/cache/save@v4
+        with:
+          path: .sentinel-state
+          key: silence-sentinel-state-${{ github.run_id }}
