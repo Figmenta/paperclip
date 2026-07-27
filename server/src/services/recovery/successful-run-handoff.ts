@@ -317,7 +317,13 @@ export function buildSuccessfulRunHandoffInstruction(input: {
     "1. Mark it `done` (scope complete) or `cancelled` (intentionally stopped).",
     "",
     "**Does someone else need to look at it?**",
-    "2. Move it to `in_review` with a real reviewer path — `executionState.currentParticipant`, a human owner via `assigneeUserId`, a pending issue-thread interaction, or a linked pending approval.",
+    // FIG-427: this list is the guidance given BEFORE the attempt; the 422 in
+    // INVALID_AGENT_IN_REVIEW_DISPOSITION_MESSAGE is the guidance given AFTER a refusal. They must
+    // name the same paths. An agent that obeys an instruction the server refuses burns its counted
+    // handoff attempts and escalates the issue to `blocked` — the exact outcome this recovery exists
+    // to prevent — so a pending interaction and a linked approval are named here as refused, not
+    // silently dropped: they were accepted before the guard changed.
+    "2. Move it to `in_review` with a designated third-party reviewer — another agent via `assigneeAgentId`, a human reviewer via `assigneeUserId`, or a typed `executionState.currentParticipant` set through an execution policy stage. A pending issue-thread interaction, a linked pending approval or a scheduled monitor does not designate a reviewer and the server refuses the move.",
     "",
     "**Can it not continue right now?**",
     "3. Mark it `blocked` with first-class blockers (`blockedByIssueIds`) or a clearly named unblock owner/action.",

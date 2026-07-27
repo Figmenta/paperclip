@@ -47,6 +47,17 @@ function registerModuleMocks() {
     accessService: () => mockAccessService,
     agentService: () => ({
       getById: vi.fn(async () => null),
+      // FIG-427: reassigning to a third-party agent routes through
+      // normalizeIssueAssigneeAgentReference, which needs this resolver.
+      resolveByReference: vi.fn(async (_companyId: string, reference: string) => ({
+        ambiguous: false,
+        agent: {
+          id: reference,
+          companyId: "company-1",
+          status: "idle",
+          orgChainHealth: { status: "healthy" },
+        },
+      })),
     }),
     documentService: () => ({}),
     executionWorkspaceService: () => ({}),
@@ -108,7 +119,9 @@ type TestActor =
     }
   | {
       type: "agent";
-      agentId: string;
+      // Nullable: an agent actor whose id never resolved is a real shape at this layer, and the
+      // in_review guard has to fail closed on it (FIG-427).
+      agentId: string | null;
       companyId: string;
       runId: string | null;
     };
@@ -175,92 +188,136 @@ describe("issue execution policy routes", () => {
     mockAccessService.hasPermission.mockResolvedValue(false);
   });
 
-  it("rejects an agent-authored in_review transition without a review path", async () => {
-    const issue = {
-      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+  // FIG-427: in_review requires a designated third-party reviewer.
+  // `CALLER` is the agent making the request; `OTHER_AGENT` is a third party.
+  const CALLER = "33333333-3333-4333-8333-333333333333";
+  const OTHER_AGENT = "55555555-5555-4555-8555-555555555555";
+  const ISSUE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+
+  function selfRetainedIssue(overrides: Record<string, unknown> = {}) {
+    return {
+      id: ISSUE_ID,
       companyId: "company-1",
       status: "todo",
-      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      assigneeAgentId: CALLER,
       assigneeUserId: null,
       createdByUserId: "local-board",
       identifier: "PAP-1003",
-      title: "Missing review path",
+      title: "Self-retained issue",
       executionPolicy: null,
       executionState: null,
+      ...overrides,
     };
-    mockIssueService.getById.mockResolvedValue(issue);
+  }
 
-    const res = await request(await createApp({
-      type: "agent",
-      agentId: "33333333-3333-4333-8333-333333333333",
-      companyId: "company-1",
-      runId: "run-1",
-    }))
-      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
-      .send({ status: "in_review" });
+  function callerActor(): TestActor {
+    return { type: "agent", agentId: CALLER, companyId: "company-1", runId: "run-1" };
+  }
 
-    expect(res.status).toBe(422);
-    expect(res.body.error).toContain("invalid_issue_disposition");
-    expect(res.body.error).toContain("request_confirmation");
-    expect(res.body.details).toMatchObject({
-      code: "invalid_issue_disposition",
-      missing: "review_path",
-    });
-    expect(mockIssueService.update).not.toHaveBeenCalled();
-  });
-
-  it("allows an agent-authored in_review transition with a pending confirmation interaction", async () => {
-    const issue = {
-      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      companyId: "company-1",
-      status: "todo",
-      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
-      assigneeUserId: null,
-      createdByUserId: "local-board",
-      identifier: "PAP-1004",
-      title: "Pending confirmation",
-      executionPolicy: null,
-      executionState: null,
-    };
-    mockIssueService.getById.mockResolvedValue(issue);
-    mockIssueThreadInteractionService.listForIssue.mockResolvedValue([
-      { id: "interaction-1", kind: "request_confirmation", status: "pending" },
-    ]);
+  function mockUpdatePassthrough(issue: Record<string, unknown>) {
     mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
       ...issue,
       ...patch,
       updatedAt: new Date(),
     }));
+  }
 
-    const res = await request(await createApp({
-      type: "agent",
-      agentId: "33333333-3333-4333-8333-333333333333",
-      companyId: "company-1",
-      runId: "run-1",
-    }))
-      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+  // --- the two shapes that must be refused ------------------------------------
+
+  it("rejects an agent-authored in_review transition that keeps the issue on the calling agent", async () => {
+    const issue = selfRetainedIssue();
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp(callerActor()))
+      .patch(`/api/issues/${ISSUE_ID}`)
       .send({ status: "in_review" });
 
-    expect(res.status).toBe(200);
-    expect(mockIssueService.update).toHaveBeenCalledWith(
-      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      expect.objectContaining({ status: "in_review" }),
-    );
+    expect(res.status).toBe(422);
+    expect(res.body.error).toContain("invalid_issue_disposition");
+    // The message must tell the agent what to do next, not only what is forbidden.
+    expect(res.body.error).toContain("assigneeAgentId");
+    expect(res.body.error).toContain("assigneeUserId");
+    expect(res.body.error).toContain("blocked");
+    expect(res.body.details).toMatchObject({
+      code: "invalid_issue_disposition",
+      missing: "third_party_reviewer",
+      resultingAssignee: "calling_agent",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
 
+  it("rejects an agent-authored in_review transition that leaves the issue unassigned", async () => {
+    const issue = selfRetainedIssue({ assigneeAgentId: null });
+    mockIssueService.getById.mockResolvedValue(issue);
+
+    const res = await request(await createApp(callerActor()))
+      .patch(`/api/issues/${ISSUE_ID}`)
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "invalid_issue_disposition",
+      missing: "third_party_reviewer",
+      resultingAssignee: "none",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  // The third-party path is read off an identity comparison, so it fails CLOSED when the caller's
+  // own id is unusable: without it we cannot tell a third-party reviewer from the agent keeping its
+  // own issue. This is the branch that produces `resultingAssignee: "unverifiable_agent"`, and it is
+  // the easiest term to drop by accident in a later refactor of
+  // `assigneeAgentId.length > 0 && callerAgentId.length > 0 && assigneeAgentId !== callerAgentId`:
+  // remove the caller-id term and an unidentifiable caller silently starts passing the guard.
+  it("refuses an in_review transition when the calling agent id is unusable, even with a third-party assignee", async () => {
+    const blankCaller = "   ";
+    const issue = selfRetainedIssue({
+      assigneeAgentId: blankCaller,
+      identifier: "PAP-1012",
+      title: "Unverifiable caller",
+    });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockUpdatePassthrough(issue);
+    // Reassigning needs the tasks:assign grant; without it the request 403s on permissions
+    // before the guard is reached.
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp({ ...callerActor(), agentId: blankCaller }))
+      .patch(`/api/issues/${ISSUE_ID}`)
+      .send({ status: "in_review", assigneeAgentId: OTHER_AGENT });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({
+      code: "invalid_issue_disposition",
+      missing: "third_party_reviewer",
+      resultingAssignee: "unverifiable_agent",
+    });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  // The other shape of an unknown caller — no agent id at all — never reaches the reviewer guard:
+  // the agent mutation gate refuses it first. Asserted here so the end-to-end claim "an unknown
+  // caller can never move an issue to in_review" stays covered even though the 422 above is not
+  // the code that enforces it.
+  it("refuses an in_review transition from an agent actor with no agent id, before the reviewer guard", async () => {
+    const issue = selfRetainedIssue({ assigneeAgentId: OTHER_AGENT, identifier: "PAP-1013" });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockUpdatePassthrough(issue);
+
+    const res = await request(await createApp({ ...callerActor(), agentId: null }))
+      .patch(`/api/issues/${ISSUE_ID}`)
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(403);
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  // --- the five things that must keep working ---------------------------------
+
+  // (1) The execution-policy lane. The stage designates the reviewer, so the transition
+  // stays legitimate even when the resulting assignee is still the calling agent.
   it("allows an agent-authored in_review transition with a typed execution participant", async () => {
-    const issue = {
-      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      companyId: "company-1",
-      status: "todo",
-      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
-      assigneeUserId: null,
-      createdByUserId: "local-board",
-      identifier: "PAP-1005",
-      title: "Execution participant",
-      executionPolicy: null,
-      executionState: null,
-    };
+    const issue = selfRetainedIssue({ identifier: "PAP-1005", title: "Execution participant" });
     const policy = normalizeIssueExecutionPolicy({
       stages: [
         {
@@ -271,24 +328,15 @@ describe("issue execution policy routes", () => {
       ],
     })!;
     mockIssueService.getById.mockResolvedValue(issue);
-    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
-      ...issue,
-      ...patch,
-      updatedAt: new Date(),
-    }));
+    mockUpdatePassthrough(issue);
 
-    const res = await request(await createApp({
-      type: "agent",
-      agentId: "33333333-3333-4333-8333-333333333333",
-      companyId: "company-1",
-      runId: "run-1",
-    }))
-      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    const res = await request(await createApp(callerActor()))
+      .patch(`/api/issues/${ISSUE_ID}`)
       .send({ status: "in_review", executionPolicy: policy });
 
     expect(res.status).toBe(200);
     expect(mockIssueService.update).toHaveBeenCalledWith(
-      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      ISSUE_ID,
       expect.objectContaining({
         status: "in_review",
         executionState: expect.objectContaining({
@@ -302,38 +350,137 @@ describe("issue execution policy routes", () => {
     );
   });
 
-  it("allows an agent-authored in_review transition with a scheduled monitor", async () => {
-    const issue = {
-      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      companyId: "company-1",
-      status: "todo",
-      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
-      assigneeUserId: null,
-      createdByUserId: "local-board",
+  // (2) Human actors. A person moving something to review is not the dead end being closed.
+  it("allows a human-authored in_review transition on a self-retained issue", async () => {
+    const issue = selfRetainedIssue({ identifier: "PAP-1008", title: "Human reviewer move" });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockUpdatePassthrough(issue);
+
+    const res = await request(await createApp({
+      type: "board",
+      userId: "local-board",
+      companyIds: ["company-1"],
+      source: "local_implicit",
+      isInstanceAdmin: false,
+    }))
+      .patch(`/api/issues/${ISSUE_ID}`)
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      ISSUE_ID,
+      expect.objectContaining({ status: "in_review" }),
+    );
+  });
+
+  // (3) The board / admins repairing stuck issues.
+  it("allows board-authored in_review repair updates without a designated reviewer", async () => {
+    const issue = selfRetainedIssue({ identifier: "PAP-1007", title: "Board repair" });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockUpdatePassthrough(issue);
+
+    const res = await request(await createApp())
+      .patch(`/api/issues/${ISSUE_ID}`)
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueThreadInteractionService.listForIssue).not.toHaveBeenCalled();
+    expect(mockIssueApprovalService.listApprovalsForIssue).not.toHaveBeenCalled();
+  });
+
+  // (4) Handing the issue to another agent: exactly the behaviour we want to encourage.
+  it("allows an agent-authored in_review transition that assigns another agent as reviewer", async () => {
+    const issue = selfRetainedIssue({ identifier: "PAP-1009", title: "Third-party reviewer" });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockUpdatePassthrough(issue);
+    // Reassigning needs the tasks:assign grant; the invariant runs before it, so without
+    // this the request would 403 on permissions instead of reaching the guard.
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp(callerActor()))
+      .patch(`/api/issues/${ISSUE_ID}`)
+      .send({ status: "in_review", assigneeAgentId: OTHER_AGENT });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      ISSUE_ID,
+      expect.objectContaining({ status: "in_review", assigneeAgentId: OTHER_AGENT }),
+    );
+  });
+
+  // (5) No retroactive enforcement: an issue already in_review is left alone, so the
+  // issues stuck before this guard existed are not touched by later agent updates.
+  it("does not enforce the reviewer invariant on an issue already in_review", async () => {
+    const issue = selfRetainedIssue({
+      status: "in_review",
+      identifier: "PAP-1010",
+      title: "Already stuck in review",
+    });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockUpdatePassthrough(issue);
+
+    const res = await request(await createApp(callerActor()))
+      .patch(`/api/issues/${ISSUE_ID}`)
+      .send({ status: "in_review", title: "Already stuck in review (retitled)" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalled();
+  });
+
+  // Assigning a human reviewer stays a valid designation.
+  it("allows an agent-authored in_review transition that assigns a human reviewer", async () => {
+    const issue = selfRetainedIssue({ identifier: "PAP-1011", title: "Human assignee" });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockUpdatePassthrough(issue);
+    mockAccessService.hasPermission.mockResolvedValue(true);
+
+    const res = await request(await createApp(callerActor()))
+      .patch(`/api/issues/${ISSUE_ID}`)
+      .send({ status: "in_review", assigneeUserId: "local-board" });
+
+    expect(res.status).toBe(200);
+    expect(mockIssueService.update).toHaveBeenCalledWith(
+      ISSUE_ID,
+      expect.objectContaining({ status: "in_review", assigneeUserId: "local-board" }),
+    );
+  });
+
+  // --- the leak this closes ----------------------------------------------------
+  // A pending interaction, a linked approval or a scheduled monitor are continuation
+  // paths, but none of them designates a reviewer. Before FIG-427 each of them was
+  // enough on its own, and that is how 4 of the 12 stuck issues got in: self-retained
+  // behind a pending request_confirmation nobody ever answered.
+
+  it("no longer accepts a pending confirmation interaction as a substitute for a reviewer", async () => {
+    const issue = selfRetainedIssue({ identifier: "PAP-1004", title: "Pending confirmation" });
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueThreadInteractionService.listForIssue.mockResolvedValue([
+      { id: "interaction-1", kind: "request_confirmation", status: "pending" },
+    ]);
+
+    const res = await request(await createApp(callerActor()))
+      .patch(`/api/issues/${ISSUE_ID}`)
+      .send({ status: "in_review" });
+
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({ missing: "third_party_reviewer" });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
+  });
+
+  it("no longer accepts a scheduled monitor as a substitute for a reviewer", async () => {
+    const issue = selfRetainedIssue({
       identifier: "PAP-1006",
       title: "External review monitor",
-      executionPolicy: null,
-      executionState: null,
       monitorAttemptCount: 0,
       monitorNextCheckAt: null,
       monitorLastTriggeredAt: null,
       monitorNotes: null,
       monitorScheduledBy: null,
-    };
+    });
     mockIssueService.getById.mockResolvedValue(issue);
-    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
-      ...issue,
-      ...patch,
-      updatedAt: new Date(),
-    }));
 
-    const res = await request(await createApp({
-      type: "agent",
-      agentId: "33333333-3333-4333-8333-333333333333",
-      companyId: "company-1",
-      runId: "run-1",
-    }))
-      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    const res = await request(await createApp(callerActor()))
+      .patch(`/api/issues/${ISSUE_ID}`)
       .send({
         status: "in_review",
         executionPolicy: {
@@ -345,45 +492,10 @@ describe("issue execution policy routes", () => {
         },
       });
 
-    expect(res.status).toBe(200);
-    expect(mockIssueService.update).toHaveBeenCalledWith(
-      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      expect.objectContaining({
-        status: "in_review",
-        monitorNextCheckAt: new Date("2026-12-01T12:00:00.000Z"),
-      }),
-    );
+    expect(res.status).toBe(422);
+    expect(res.body.details).toMatchObject({ missing: "third_party_reviewer" });
+    expect(mockIssueService.update).not.toHaveBeenCalled();
   });
-
-  it("allows board-authored in_review repair updates without a review path", async () => {
-    const issue = {
-      id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-      companyId: "company-1",
-      status: "todo",
-      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
-      assigneeUserId: null,
-      createdByUserId: "local-board",
-      identifier: "PAP-1007",
-      title: "Board repair",
-      executionPolicy: null,
-      executionState: null,
-    };
-    mockIssueService.getById.mockResolvedValue(issue);
-    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
-      ...issue,
-      ...patch,
-      updatedAt: new Date(),
-    }));
-
-    const res = await request(await createApp())
-      .patch("/api/issues/aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
-      .send({ status: "in_review" });
-
-    expect(res.status).toBe(200);
-    expect(mockIssueThreadInteractionService.listForIssue).not.toHaveBeenCalled();
-    expect(mockIssueApprovalService.listApprovalsForIssue).not.toHaveBeenCalled();
-  });
-
   it("does not auto-start execution review when reviewers are added to an already in_review issue", async () => {
     const policy = normalizeIssueExecutionPolicy({
       stages: [
