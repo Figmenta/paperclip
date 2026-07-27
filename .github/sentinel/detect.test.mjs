@@ -16,6 +16,7 @@ import assert from "node:assert/strict";
 
 import {
   DEFAULT_THRESHOLDS,
+  detectMergedNotDeployed,
   diffFindings,
   escalationTier,
   evaluate,
@@ -424,6 +425,72 @@ test("escalation bands double", () => {
   assert.equal(escalationTier(120 * MINUTE, 30), 2);
   assert.equal(escalationTier(240 * MINUTE, 30), 3);
   assert.equal(escalationTier(10_000 * MINUTE, 30), 3, "the ladder tops out");
+});
+
+test("a non-positive threshold does not pin every finding to the top band", () => {
+  // The bug this pins down: `ageMs / 0` is Infinity, which is >= every rung of
+  // the ladder, so a fat-fingered override would have made everything tier 3 —
+  // permanently maximal, and therefore meaningless.
+  assert.equal(escalationTier(90 * MINUTE, 0), 0, "a zero threshold has no bands");
+  assert.equal(escalationTier(90 * MINUTE, -30), 0, "a negative threshold has no bands");
+  assert.equal(escalationTier(90 * MINUTE, Number.NaN), 0);
+  assert.equal(escalationTier(90 * MINUTE, undefined), 0);
+  assert.equal(escalationTier(90 * MINUTE, Number.POSITIVE_INFINITY), 0);
+
+  // And end to end: a zero override still cannot manufacture an escalation.
+  const { findings } = evaluate(
+    snapshot({
+      openPulls: [pull550()],
+      thresholds: { ...DEFAULT_THRESHOLDS, staleApprovalMinutes: 0 },
+    }),
+  );
+  assert.equal(findings.length, 1);
+  assert.equal(findings[0].tier, 0, "no threshold means no escalation, not maximum escalation");
+});
+
+test("a merged PR with no merge commit sha is skipped, not reported", () => {
+  const merged = {
+    repo: "Figmenta/orchestra",
+    number: 541,
+    title: "a merge with no recorded sha",
+    url: "https://github.com/Figmenta/orchestra/pull/541",
+    mergedAtMs: ago(120),
+    mergeCommitSha: null,
+  };
+
+  // Nothing to match against the deploy evidence, so the sha check could never
+  // succeed and the condition would otherwise fire on every single scan.
+  const result = evaluate(
+    snapshot({
+      mergedPulls: [merged],
+      deploy: { enabled: true, source: "workflow:deploy.yml", successfulShas: ["f".repeat(40)] },
+    }),
+  );
+  assert.deepEqual(result.findings, []);
+  const entry = result.skipped.find((item) => item.condition === "merged_not_deployed");
+  assert.ok(entry, "cannot-evaluate is declared, not silently dropped");
+  assert.match(entry.reason, /#541/, "names the PR it could not evaluate");
+
+  // The detector says the same thing on its own.
+  assert.equal(
+    detectMergedNotDeployed(
+      merged,
+      { enabled: true, source: "workflow:deploy.yml", successfulShas: [] },
+      { nowMs: NOW, thresholds: DEFAULT_THRESHOLDS },
+    ),
+    null,
+  );
+
+  // A sibling with a real sha in the same batch is still reported: one
+  // unevaluable PR must not take the others down with it.
+  const both = evaluate(
+    snapshot({
+      mergedPulls: [merged, { ...merged, number: 542, mergeCommitSha: "e".repeat(40) }],
+      deploy: { enabled: true, source: "workflow:deploy.yml", successfulShas: ["f".repeat(40)] },
+    }),
+  );
+  assert.equal(both.findings.length, 1);
+  assert.equal(both.findings[0].subject, "#542 a merge with no recorded sha");
 });
 
 test("the worst and oldest is reported first", () => {

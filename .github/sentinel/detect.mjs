@@ -82,8 +82,15 @@ export function minutes(ms) {
 /**
  * Which escalation band an age falls into. Band 0 is "over threshold", each
  * further band is a doubling. Ages below the threshold have no band.
+ *
+ * A non-positive threshold has no bands to speak of: the ratio would be
+ * Infinity (or NaN) and every finding would pin to the top tier, so the ladder
+ * would say "as bad as it gets" about everything and mean nothing. Band 0 is
+ * the honest answer — over threshold, not escalated. The shell also refuses
+ * such an override at the boundary; this is the pure-side floor under it.
  */
 export function escalationTier(ageMs, thresholdMinutes) {
+  if (!(Number.isFinite(thresholdMinutes) && thresholdMinutes > 0)) return 0;
   const ratio = ageMs / (thresholdMinutes * MINUTE_MS);
   let tier = 0;
   for (let index = 1; index < ESCALATION_MULTIPLIERS.length; index += 1) {
@@ -235,6 +242,14 @@ export function detectCiStuck(pull, { nowMs, thresholds }) {
 
 /** 3. Merged, and never served. */
 export function detectMergedNotDeployed(merged, deploy, { nowMs, thresholds }) {
+  // Without a merge commit sha there is nothing to look for in the deploy
+  // evidence, so the sha-match below could never succeed and the condition
+  // would fire on every scan for reasons that have nothing to do with the
+  // deploy. Absent evidence is not evidence of absence: this is "cannot
+  // evaluate", and `evaluate` declares it skipped the way the off-conditions
+  // are declared, rather than passing it off as a clean read.
+  if (!merged.mergeCommitSha) return null;
+
   const ageMs = nowMs - merged.mergedAtMs;
   const threshold = thresholds.mergedNotDeployedMinutes;
   if (ageMs < threshold * MINUTE_MS) return null;
@@ -297,6 +312,13 @@ export function evaluate(snapshot) {
   const deploy = snapshot.deploy ?? { enabled: false };
   if (deploy.enabled) {
     for (const merged of snapshot.mergedPulls ?? []) {
+      if (!merged.mergeCommitSha) {
+        skipped.push({
+          condition: "merged_not_deployed",
+          reason: `#${merged.number} has no merge commit sha; deploy evidence cannot be matched against it`,
+        });
+        continue;
+      }
       const hit = detectMergedNotDeployed(merged, deploy, context);
       if (hit) findings.push(hit);
     }
