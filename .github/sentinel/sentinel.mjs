@@ -354,6 +354,15 @@ function renderReport(repo, alerts) {
  * anything else — including a redirect that resolves to a cheerful 200 on some
  * login page — is a delivery failure, which is why the check is on the exact
  * status rather than on `response.ok`.
+ *
+ * Accepted is not yet delivered. The ingest fans out to two independent legs
+ * and neither is allowed to fail the other, so it answers 202 and names the
+ * legs that actually landed in `delivered`. An empty list means the alert was
+ * accepted and then reached nobody — which, taken as success, would advance
+ * the ledger and leave the finding spoken exactly zero times: the sentinel
+ * failing in the one way it exists to catch. So an empty list is a delivery
+ * failure. A body without the field is left alone: that is the frozen contract
+ * as written, and this must not break on an ingest that only promises 202.
  */
 async function deliver(repo, alerts, dryRun) {
   const report = renderReport(repo, alerts);
@@ -395,7 +404,22 @@ async function deliver(repo, alerts, dryRun) {
     if (response.status !== 202) {
       throw new Error(`${response.status} ${(await response.text()).slice(0, 200)}`);
     }
-    return ["orchestra"];
+
+    const body = await response.json().catch(() => null);
+    const legs = Array.isArray(body?.delivered) ? body.delivered.map(String) : null;
+    if (legs === null) return ["orchestra"];
+    if (legs.length === 0) {
+      throw new Error(`202 accepted but delivered to no leg: ${JSON.stringify(body).slice(0, 200)}`);
+    }
+    // A partial fan-out still reached somebody, so the finding is announced and
+    // the ledger may advance — but the leg that failed is not allowed to pass
+    // in silence either.
+    for (const [name, leg] of Object.entries(body ?? {})) {
+      if (name !== "delivered" && leg && typeof leg === "object" && leg.ok === false) {
+        console.error(`::warning::alert ingest leg '${name}' failed: ${leg.reason ?? "no reason given"}`);
+      }
+    }
+    return legs.map((leg) => `orchestra:${leg}`);
   } catch (error) {
     console.error(`::warning::alert ingest failed: ${error.message}`);
     return [];
