@@ -363,6 +363,17 @@ type IssueUserContextInput = {
 };
 type ProjectGoalReader = Pick<Db, "select">;
 type DbReader = Pick<Db, "select">;
+// FIG-550: diagnostic shape attached to the `details` of every ownership 409,
+// so a caller can tell a live claim from an orphan lock without a second API
+// round trip (GET /api/runs/{id} is not agent-reachable).
+type LockHolderDiagnostics = {
+  lockHolderRunId: string | null;
+  lockHolderRunStatus: string | null;
+  scheduledRetryAt?: string | null;
+  scheduledRetryAttempt?: number;
+  scheduledRetryReason?: string | null;
+  resolution: string;
+};
 type IssueCreateInput = Omit<typeof issues.$inferInsert, "companyId"> & {
   labelIds?: string[];
   blockedByIssueIds?: string[];
@@ -3842,6 +3853,98 @@ export function issueService(db: Db) {
     return TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status);
   }
 
+  // FIG-550: an ownership 409 that names only the run id makes a legitimate lock
+  // and an orphan lock indistinguishable from outside — FIG-547 burned an
+  // escalation on exactly that ambiguity, because a run parked in
+  // `scheduled_retry` (a live, future claim) reads the same as a dead one.
+  // Everything below is diagnostic payload for the 409 body: read-only, only
+  // ever built on the error path, and with zero bearing on who owns the lock.
+  async function describeLockHolderRun(
+    runId: string | null,
+    dbOrTx: DbReader = db,
+  ): Promise<LockHolderDiagnostics> {
+    if (!runId) {
+      return {
+        lockHolderRunId: null,
+        lockHolderRunStatus: null,
+        resolution:
+          "No heartbeat run holds this issue: the conflict comes from the issue status or assignee, "
+          + "not from a run lock.",
+      };
+    }
+
+    const run = await dbOrTx
+      .select({
+        status: heartbeatRuns.status,
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        scheduledRetryAttempt: heartbeatRuns.scheduledRetryAttempt,
+        scheduledRetryReason: heartbeatRuns.scheduledRetryReason,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId))
+      .then((rows) => rows[0] ?? null);
+
+    if (!run) {
+      return {
+        lockHolderRunId: runId,
+        lockHolderRunStatus: "missing",
+        resolution:
+          `Run ${runId} no longer exists, so it holds no real claim. The lock self-clears on the next `
+          + "ownership check (clearExecutionRunIfTerminal / clearCheckoutRunIfTerminal): retry the request. "
+          + "If it still conflicts, the blocker is the issue status or assignee, not the run lock.",
+      };
+    }
+
+    if (run.status === "scheduled_retry") {
+      const scheduledRetryAt = run.scheduledRetryAt ? run.scheduledRetryAt.toISOString() : null;
+      const when = scheduledRetryAt ? `at ${scheduledRetryAt}` : "once its backoff elapses";
+      const reason = run.scheduledRetryReason ? `, reason ${run.scheduledRetryReason}` : "";
+      return {
+        lockHolderRunId: runId,
+        lockHolderRunStatus: run.status,
+        scheduledRetryAt,
+        scheduledRetryAttempt: run.scheduledRetryAttempt,
+        scheduledRetryReason: run.scheduledRetryReason,
+        resolution:
+          `A pending retry (run ${runId}, attempt ${run.scheduledRetryAttempt}${reason}) holds this issue `
+          + `and will resume it ${when}. This is a live claim, not an orphan lock: no recovery is needed, `
+          + "wait for the retry. Promoting it early is board-only "
+          + "(POST /api/issues/{id}/scheduled-retry/retry-now).",
+      };
+    }
+
+    if (TERMINAL_HEARTBEAT_RUN_STATUSES.has(run.status)) {
+      return {
+        lockHolderRunId: runId,
+        lockHolderRunStatus: run.status,
+        resolution:
+          `Run ${runId} is terminal (${run.status}), so it holds no real claim. The lock self-clears on the `
+          + "next ownership check (clearExecutionRunIfTerminal / clearCheckoutRunIfTerminal): retry the "
+          + "request. If it still conflicts, the blocker is the issue status or assignee, not the run lock.",
+      };
+    }
+
+    return {
+      lockHolderRunId: runId,
+      lockHolderRunStatus: run.status,
+      resolution:
+        `Run ${runId} is still ${run.status}: the lock is live and held by another run. This is not an `
+        + "orphan lock and needs no recovery — wait for that run to reach a terminal status, after which "
+        + "the lock self-clears on the next ownership check.",
+    };
+  }
+
+  // The run that actually refuses the caller: assertCheckoutOwner gates on
+  // checkoutRunId first, and only falls through to executionRunId when there is
+  // no checkout owner (the canAdoptUnownedCheckout guard) — which is the shape
+  // FIG-547 hit.
+  function describeIssueLockHolder(
+    candidate: { checkoutRunId: string | null; executionRunId: string | null },
+    dbOrTx: DbReader = db,
+  ) {
+    return describeLockHolderRun(candidate.checkoutRunId ?? candidate.executionRunId, dbOrTx);
+  }
+
   async function adoptStaleCheckoutRun(input: {
     issueId: string;
     actorAgentId: string;
@@ -5894,6 +5997,7 @@ export function issueService(db: Db) {
           executionRunId: resolvedLatest.latest.executionRunId,
           actorAgentId,
           actorRunId,
+          ...(await describeIssueLockHolder(resolvedLatest.latest)),
         });
       }
 
@@ -5905,6 +6009,7 @@ export function issueService(db: Db) {
         executionRunId: latest.executionRunId,
         actorAgentId,
         actorRunId,
+        ...(await describeIssueLockHolder(latest)),
       });
     },
 
@@ -5937,6 +6042,7 @@ export function issueService(db: Db) {
               assigneeAgentId: existing.assigneeAgentId,
               checkoutRunId: existing.checkoutRunId,
               actorRunId: actorRunId ?? null,
+              ...(await describeLockHolderRun(existing.checkoutRunId, tx)),
             });
           }
         }
