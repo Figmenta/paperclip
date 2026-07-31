@@ -57,11 +57,14 @@ export const modelProfiles: AdapterModelProfileDefinition[] = [
   {
     key: "cheap",
     label: "Cheap",
-    description: "Use the lowest-cost known Codex local model lane without changing the primary model.",
+    description: "Use the lowest-cost Codex local model lane without changing the primary model.",
     adapterConfig: {
-      model: "gpt-5.3-codex-spark",
-      // Spark is the cheap lane by model price; high effort keeps Codex coding behavior usable for delegated work.
-      modelReasoningEffort: "high",
+      model: "gpt-5.5",
+      // gpt-5.3-codex-spark is rejected with a 400 on ChatGPT-account auth ("not supported when
+      // using Codex with a ChatGPT account"), which killed every cheap-profile run in ~4s
+      // (FIG-714: 77 runs since 2026-07-11). On subscription auth the served lane is gpt-5.5;
+      // low reasoning effort is what makes it the cheap lane, mirroring claude_local's cheap.
+      modelReasoningEffort: "low",
     },
     source: "adapter_default",
   },
