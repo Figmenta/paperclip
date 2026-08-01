@@ -893,7 +893,11 @@ export async function startServer(): Promise<StartedServer> {
 
         for (let attempt = 1; attempt <= 2; attempt++) {
           try {
-            const result = await heartbeat.reapOrphanedRuns();
+            // FIG-132: hardTtlMs switches on the absolute-age backstop. It is opt-in in
+            // the reaper so unit fixtures stay unaffected, and per-run it is widened to
+            // an agent's declared adapterConfig.timeoutSec plus a grace, so it can never
+            // preempt the agent's own timeout.
+            const result = await heartbeat.reapOrphanedRuns({ hardTtlMs: 30 * 60 * 1000 });
             logger.info(
               { reaped: result.reaped, runIds: result.runIds },
               "startup reap of orphaned heartbeat runs complete",
@@ -1043,7 +1047,7 @@ export async function startServer(): Promise<StartedServer> {
           // Periodically reap orphaned runs (5-min staleness threshold) and make sure
           // persisted queued work is still being driven forward.
           trackHeartbeatSchedulerWork(heartbeat
-            .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000 })
+            .reapOrphanedRuns({ staleThresholdMs: 5 * 60 * 1000, hardTtlMs: 30 * 60 * 1000 })
             .then(() => heartbeat.promoteDueScheduledRetries())
             .then(async (promotion) => {
               await heartbeat.resumeQueuedRuns();

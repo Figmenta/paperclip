@@ -315,6 +315,20 @@ const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
 const PAPERCLIP_HARNESS_CHECKOUT_KEY = "paperclipHarnessCheckedOut";
 const DETACHED_PROCESS_ERROR_CODE = "process_detached";
+// FIG-132: absolute-age ceiling for reapOrphanedRuns. A run still `status=running`
+// past this age with no fresh liveness signal is finalized regardless of an
+// in-memory process handle or a (by now almost certainly recycled) live pid, so an
+// orphaned run can never hold an issue checkout indefinitely — the FIG-131 symptom.
+// Default-disabled in the reaper (0) and switched on explicitly by the prod call
+// sites, mirroring the `staleThresholdMs` precedent so unit fixtures are unaffected.
+const REAP_HARD_TTL_MS = 30 * 60 * 1000;
+// FIG (2026-07-25): the backstop must never preempt an agent's OWN timeout. That one
+// ends the run gracefully and reports why on the issue; this one finalizes it from
+// outside, discarding live work. An agent that declares `adapterConfig.timeoutSec`
+// gets its full budget plus this grace before the backstop applies; one that declares
+// none keeps REAP_HARD_TTL_MS unchanged.
+const HARD_TTL_AGENT_GRACE_MS = 5 * 60 * 1000;
+const HARD_TTL_REAP_ERROR_CODE = "process_hard_ttl_reaped";
 const REPO_ONLY_CWD_SENTINEL = "/__paperclip_repo_only__";
 const MANAGED_WORKSPACE_GIT_CLONE_TIMEOUT_MS = 10 * 60 * 1000;
 const MAX_INLINE_WAKE_COMMENTS = 8;
@@ -11349,8 +11363,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       .then((rows) => rows[0] ?? null);
   }
 
-  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number }) {
+  async function reapOrphanedRuns(opts?: { staleThresholdMs?: number; hardTtlMs?: number }) {
     const staleThresholdMs = opts?.staleThresholdMs ?? 0;
+    const hardTtlMs = opts?.hardTtlMs ?? 0;
     const now = new Date();
 
     // Find all runs stuck in "running" state (queued runs are legitimately waiting; resumeQueuedRuns handles them)
@@ -11390,10 +11405,49 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const reaped: string[] = [];
 
     for (const { run, adapterType, adapterConfig } of activeRuns) {
-      if (runningProcesses.has(run.id) || activeRunExecutions.has(run.id)) continue;
+      // FIG-132 hard-TTL backstop. A run still `running` past an absolute-age ceiling
+      // must be finalized OVER the in-memory-handle and live-pid guards below: past the
+      // ceiling an in-memory entry is almost certainly a leak and a live pid almost
+      // certainly a reuse, so neither may keep a dead run pinned at `running`/`null`
+      // liveness holding an issue checkout (FIG-131).
+      //
+      // Per-run ceiling: never shorter than what the agent was promised. A run killed by
+      // this backstop loses its work, so it must only ever catch a run the agent's own
+      // timeout did NOT already end (fig r7 — the 30m default was the shortest of three
+      // racing limits and finalized live, producing runs).
+      //
+      // Ported to v2026.722.0 (FIG-785 §2) as a GUARD-SUPPRESSION PREDICATE rather than
+      // the original standalone finalization block. Upstream grew two skip conditions
+      // inside this loop that the original patch inserted itself above — monitor re-arm
+      // and hot-restart adoption — and duplicating the finalization would have silently
+      // dropped both. Expressing the ceiling as "do not take the early exits" instead
+      // routes hard-TTL runs through upstream's single finalization path, so upstream's
+      // monitor re-arm survives; see hardTtlDefinitiveRelease below for how the reap's
+      // definitive-release semantics compose with upstream's retry decision.
+      const declaredTimeoutMs = (() => {
+        const cfg = adapterConfig as Record<string, unknown> | null;
+        const secs = cfg && typeof cfg.timeoutSec === "number" ? cfg.timeoutSec : 0;
+        return secs > 0 ? secs * 1000 : 0;
+      })();
+      const effectiveTtlMs =
+        declaredTimeoutMs > 0
+          ? Math.max(hardTtlMs, declaredTimeoutMs + HARD_TTL_AGENT_GRACE_MS)
+          : hardTtlMs;
+      const hardTtlFreshnessTs = Math.max(
+        run.lastOutputAt ? new Date(run.lastOutputAt).getTime() : 0,
+        run.lastUsefulActionAt ? new Date(run.lastUsefulActionAt).getTime() : 0,
+        run.updatedAt ? new Date(run.updatedAt).getTime() : 0,
+        run.startedAt ? new Date(run.startedAt).getTime() : 0,
+      );
+      const hardTtlAgeMs =
+        hardTtlFreshnessTs > 0 ? now.getTime() - hardTtlFreshnessTs : Number.POSITIVE_INFINITY;
+      const hardTtlExceeded = effectiveTtlMs > 0 && hardTtlAgeMs > effectiveTtlMs;
+      const inMemoryHandle = runningProcesses.has(run.id) || activeRunExecutions.has(run.id);
+
+      if (inMemoryHandle && !hardTtlExceeded) continue;
 
       // Apply staleness threshold to avoid false positives
-      if (staleThresholdMs > 0) {
+      if (staleThresholdMs > 0 && !hardTtlExceeded) {
         const refTime = run.updatedAt ? new Date(run.updatedAt).getTime() : 0;
         if (now.getTime() - refTime < staleThresholdMs) continue;
       }
@@ -11401,13 +11455,18 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       const tracksLocalChild = isTrackedLocalChildProcessAdapter(adapterType);
       const processPidAlive = tracksLocalChild && run.processPid && isProcessAlive(run.processPid);
       const processGroupAlive = tracksLocalChild && run.processGroupId && isProcessGroupAlive(run.processGroupId);
+      // Hot-restart adoption stays an UNCONDITIONAL exemption, ceiling or not: a run with a
+      // live pid/pgid carrying adoption metadata was legitimately re-attached across a
+      // restart, and the ceiling exists to catch runs whose liveness signal is stale or
+      // leaked, not runs that are provably alive and accounted for. Reaping one would be
+      // the r7 mistake (discarding live work) against a run upstream itself skips here.
       if (
         (processPidAlive || processGroupAlive) &&
         readHotRestartAdoptionMetadata(parseObject(run.resultJson))
       ) {
         continue;
       }
-      if (processPidAlive) {
+      if (processPidAlive && !hardTtlExceeded) {
         if (run.errorCode !== DETACHED_PROCESS_ERROR_CODE) {
           const detachedMessage = `Lost in-memory process handle, but child pid ${run.processPid} is still alive`;
           const detachedRun = await setRunStatus(run.id, "running", {
@@ -11451,7 +11510,31 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         (tracksLocalChild && (!!run.processPid || !!run.processGroupId)) ||
         monitorDispatchLostWithoutFutureWake
       );
-      const baseMessage = buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      // FIG-132 §2 reconciliation with v2026.722.0. A hard-TTL reap is definitive — the
+      // run is dead past its ceiling, not transiently lost — so it releases the issue
+      // rather than queueing a process-loss retry that would re-inherit the checkout.
+      //
+      // The ONE exception is upstream's monitor case, which did not exist at
+      // v2026.626.0: a lost `issue_monitor_due` dispatch with no future wake is re-armed
+      // ONLY by this retry. Suppressing it would reap the run and leave the monitor
+      // silently dead — no error, nothing in the test net, the monitor simply stops.
+      // That is precisely the bug the original patch's top-of-loop placement would have
+      // introduced on this base, so the monitor keeps upstream's retry.
+      const hardTtlDefinitiveRelease = hardTtlExceeded && !monitorDispatchLostWithoutFutureWake;
+      const effectiveShouldRetry = hardTtlDefinitiveRelease ? false : shouldRetry;
+      // FIG-132: a hard-TTL reap gets its own message and errorCode so it is
+      // distinguishable from an ordinary process-loss reap in logs and in run history.
+      // The retry-vs-release decision is upstream's `shouldRetry`, narrowed by
+      // `hardTtlDefinitiveRelease` below.
+      const hardTtlAgeLabel = Number.isFinite(hardTtlAgeMs)
+        ? `${Math.round(hardTtlAgeMs / 60_000)}m`
+        : "unknown age";
+      const baseMessage = hardTtlExceeded
+        ? `Run exceeded hard TTL (${hardTtlAgeLabel}, ceiling ${Math.round(effectiveTtlMs / 60_000)}m) while still \`running\`; ` +
+          `finalized regardless of in-memory handle (${inMemoryHandle ? "present" : "absent"}) or ` +
+          `recorded pid ${run.processPid ?? "none"} (assumed recycled past the ceiling).`
+        : buildProcessLossMessage(run, descendantOnlyCleanup ? { descendantOnly: true } : undefined);
+      const reapErrorCode = hardTtlExceeded ? HARD_TTL_REAP_ERROR_CODE : "process_lost";
       const unmanagedBackgroundTaskEvidence = descendantOnlyCleanup
         ? {
           kind: "orphaned_process_group_cleanup",
@@ -11464,8 +11547,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         : null;
 
       let finalizedRun = await setRunStatus(run.id, "failed", {
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
-        errorCode: "process_lost",
+        error: effectiveShouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+        errorCode: reapErrorCode,
         finishedAt: now,
         resultJson: (() => {
           const result = mergeRunStopMetadataForAgent(
@@ -11473,8 +11556,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             "failed",
             {
               resultJson: parseObject(run.resultJson),
-              errorCode: "process_lost",
-              errorMessage: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+              errorCode: reapErrorCode,
+              errorMessage: effectiveShouldRetry ? `${baseMessage}; retrying once` : baseMessage,
             },
           );
           return unmanagedBackgroundTaskEvidence
@@ -11488,10 +11571,20 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       });
       await setWakeupStatus(run.wakeupRequestId, "failed", {
         finishedAt: now,
-        error: shouldRetry ? `${baseMessage}; retrying once` : baseMessage,
+        error: effectiveShouldRetry ? `${baseMessage}; retrying once` : baseMessage,
       });
       if (!finalizedRun) finalizedRun = await getRun(run.id);
-      if (!finalizedRun) continue;
+      if (!finalizedRun) {
+        // FIG-132: a hard-TTL run is the one case that reaches here holding a leaked
+        // in-memory entry (every other path `continue`d on it above). Bailing out without
+        // clearing both maps would leave that leak in place and make the run permanently
+        // un-reapable — the FIG-131 symptom this backstop exists to end.
+        if (hardTtlExceeded) {
+          runningProcesses.delete(run.id);
+          activeRunExecutions.delete(run.id);
+        }
+        continue;
+      }
       finalizedRun = await classifyAndPersistRunLiveness(finalizedRun, parseObject(finalizedRun.resultJson)) ?? finalizedRun;
       await releaseEnvironmentLeasesForRun({
         runId: finalizedRun.id,
@@ -11503,11 +11596,15 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
       let retriedRun: typeof heartbeatRuns.$inferSelect | null = null;
       const retryAgent = await getAgent(run.agentId);
-      if (shouldRetry) {
+      if (effectiveShouldRetry) {
         if (retryAgent) {
           retriedRun = await enqueueProcessLossRetry(finalizedRun, retryAgent, now);
         }
-      } else if (retryAgent) {
+      } else if (retryAgent && !hardTtlDefinitiveRelease) {
+        // FIG-132: the interaction-continuation retry is suppressed on a definitive
+        // hard-TTL reap for the same reason as the process-loss retry — any scheduled
+        // retry keeps `retriedRun` non-null below and so skips the release, which would
+        // leave the checkout pinned by exactly the run the backstop just declared dead.
         const scheduled = await scheduleInteractionContinuationInfrastructureRetryIfEligible(finalizedRun, retryAgent);
         retriedRun = scheduled?.outcome === "scheduled" ? scheduled.run : null;
       }
@@ -11520,7 +11617,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         eventType: "lifecycle",
         stream: "system",
         level: "error",
-        message: shouldRetry
+        message: effectiveShouldRetry
           ? `${baseMessage}; queued retry ${retriedRun?.id ?? ""}`.trim()
           : baseMessage,
         payload: {
@@ -11528,12 +11625,26 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           ...(run.processGroupId ? { processGroupId: run.processGroupId } : {}),
           ...(descendantOnlyCleanup ? { descendantOnlyCleanup: true } : {}),
           ...(retriedRun ? { retryRunId: retriedRun.id } : {}),
+          // FIG-132: keep the hard-TTL reap identifiable in run history.
+          ...(hardTtlExceeded
+            ? {
+              hardTtlReaped: true,
+              hardTtlMs: effectiveTtlMs,
+              inMemoryHandle,
+              ...(Number.isFinite(hardTtlAgeMs) ? { ageMs: hardTtlAgeMs } : {}),
+            }
+            : {}),
         },
       });
 
       await finalizeAgentStatus(run.agentId, "failed", baseMessage);
       await startNextQueuedRunForAgent(run.agentId);
       runningProcesses.delete(run.id);
+      // FIG-132: upstream never needs to clear activeRunExecutions here, because a run
+      // holding an in-memory entry is skipped at the top of the loop. The hard-TTL path
+      // deliberately does not skip it, so it must clear it — otherwise the very leak the
+      // backstop was written to survive outlives the reap.
+      if (hardTtlExceeded) activeRunExecutions.delete(run.id);
       reaped.push(run.id);
     }
 
