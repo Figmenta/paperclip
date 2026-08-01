@@ -363,8 +363,12 @@ function renderReport(repo, alerts) {
  * failing in the one way it exists to catch. So an empty list is a delivery
  * failure. A body without the field is left alone: that is the frozen contract
  * as written, and this must not break on an ingest that only promises 202.
+ * Left alone, but not unremarked — see `caveats`.
+ *
+ * `caveats` collects the assumptions this delivery had to make, so the run
+ * summary can carry them the way it carries truncated reads.
  */
-async function deliver(repo, alerts, dryRun) {
+async function deliver(repo, alerts, dryRun, caveats = []) {
   const report = renderReport(repo, alerts);
 
   if (dryRun) {
@@ -407,7 +411,19 @@ async function deliver(repo, alerts, dryRun) {
 
     const body = await response.json().catch(() => null);
     const legs = Array.isArray(body?.delivered) ? body.delivered.map(String) : null;
-    if (legs === null) return ["orchestra"];
+    if (legs === null) {
+      // Still a success: the frozen contract promises the status code and
+      // nothing more. But this is the one path that quietly falls back to
+      // "accepted means delivered", so it must not be the one path nobody is
+      // told about — if the field ever disappears (a refactor, a proxy that
+      // rewrites the body), the per-leg check switches off and the run would
+      // otherwise read exactly like a healthy one.
+      const caveat =
+        "alert ingest returned 202 without a `delivered` field; treating as delivered, but the per-leg check is inactive";
+      console.error(`::warning::${caveat}`);
+      caveats.push(caveat);
+      return ["orchestra"];
+    }
     if (legs.length === 0) {
       throw new Error(`202 accepted but delivered to no leg: ${JSON.stringify(body).slice(0, 200)}`);
     }
@@ -465,8 +481,12 @@ async function main() {
   // trusts it reads a bounded scan as a complete one.
   const summaryLines = gh.truncations.map((truncation) => `> **Truncated read** — ${truncation}`);
 
+  // Assumptions the delivery had to make. Same reasoning as the truncations
+  // above: a caveat only in the log is invisible to whoever reads the summary.
+  const caveats = [];
+
   if (alerts.length > 0) {
-    const delivered = await deliver(repo, alerts, dryRun);
+    const delivered = await deliver(repo, alerts, dryRun, caveats);
     console.log(renderReport(repo, alerts));
     console.log(`delivered via: ${delivered.join(", ") || "nothing configured"}`);
     summaryLines.unshift(`### Silence sentinel — ${alerts.length} announced`, "", ...alerts.map(renderAlert), "");
@@ -492,6 +512,8 @@ async function main() {
     // The empty run is the common case and it says nothing anywhere.
     console.log("silence is clean: nothing new, nothing worsening");
   }
+
+  for (const caveat of caveats) summaryLines.push(`> **Delivery caveat** — ${caveat}`);
 
   if (summaryLines.length > 0) await summarize(summaryLines);
 
