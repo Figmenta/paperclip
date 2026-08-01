@@ -13,6 +13,14 @@
 # reads every recipient from repository secrets/variables, so copying these two
 # files into another repo is the whole port.
 #
+# One egress, fanned out server-side. This job runs on a GitHub-hosted runner,
+# off our network, so the only reachable destination is a public one: the
+# Paperclip API answers an off-host POST with a Cloudflare Access redirect that
+# no token can satisfy, and a Discord webhook would be an anonymous credential
+# in a public repository. Both recipients are therefore addressed by Orchestra
+# from inside, and this repository holds exactly one secret whose entire power
+# is "file a sentinel alert".
+#
 # Note on scheduled runs in a fork: GitHub disables scheduled workflows in
 # forked repositories until Actions is enabled there, and auto-disables the
 # schedule on a public repository after 60 days without activity. The
@@ -96,11 +104,14 @@ jobs:
           SENTINEL_DRY_RUN: ${{ inputs.dry_run || 'false' }}
           SENTINEL_STATE_FILE: .sentinel-state/state.json
 
-          # Recipients. Referenced, never written: an unset value simply turns
-          # that sink off and the run says so in its log.
-          SENTINEL_PAPERCLIP_ISSUE_URL: ${{ vars.SENTINEL_PAPERCLIP_ISSUE_URL }}
-          SENTINEL_PAPERCLIP_TOKEN: ${{ secrets.SENTINEL_PAPERCLIP_TOKEN }}
-          SENTINEL_DISCORD_WEBHOOK_URL: ${{ secrets.SENTINEL_DISCORD_WEBHOOK_URL }}
+          # The single sink. Orchestra receives the alert and fans it out to the
+          # triage issue and the ops channel from inside our network. The URL is
+          # a variable with the production default inline — it addresses a
+          # public endpoint, so it is configuration, not a recipient to hide.
+          # The key is the secret, and an unset key simply turns the sink off
+          # and the run says so in its log.
+          SENTINEL_INGEST_URL: ${{ vars.SENTINEL_INGEST_URL || 'https://orchestra.figmenta.site/sentinel/alert' }}
+          SENTINEL_INGEST_KEY: ${{ secrets.SENTINEL_INGEST_KEY }}
 
           # Deploy evidence. Unset on both counts means condition 3 stays off
           # rather than reporting every merge as unserved.

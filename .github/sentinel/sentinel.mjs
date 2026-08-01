@@ -14,9 +14,8 @@
  *   SENTINEL_REPO / GITHUB_REPOSITORY      owner/name to scan
  *   SENTINEL_STATE_FILE                    anti-noise ledger path
  *   SENTINEL_DRY_RUN                       "true" → report to stdout, deliver nothing
- *   SENTINEL_PAPERCLIP_ISSUE_URL           POST target that opens a triage issue
- *   SENTINEL_PAPERCLIP_TOKEN               bearer for the above
- *   SENTINEL_DISCORD_WEBHOOK_URL           ops channel webhook
+ *   SENTINEL_INGEST_URL                    the one egress: Orchestra's alert ingest
+ *   SENTINEL_INGEST_KEY                    bearer for the above
  *   SENTINEL_DEPLOY_WORKFLOW               workflow file name that proves a deploy
  *   SENTINEL_DEPLOY_ENVIRONMENT            deployments-API environment, alternative to the above
  *   SENTINEL_DIRECTOR_STATUS_URL           director heartbeat probe (off until Maestro exists)
@@ -35,13 +34,33 @@ function env(name, fallback = undefined) {
   return value === undefined || value === "" ? fallback : value;
 }
 
+/** Below this, an override is a typo rather than an intent. */
+const MIN_THRESHOLD_MINUTES = 1;
+
 function thresholdsFromEnv() {
   const thresholds = { ...DEFAULT_THRESHOLDS };
   for (const key of Object.keys(DEFAULT_THRESHOLDS)) {
     // approvedNotMergedMinutes → SENTINEL_APPROVED_NOT_MERGED_MINUTES
     const envName = `SENTINEL_${key.replace(/([A-Z])/g, "_$1").toUpperCase()}`;
     const raw = env(envName);
-    if (raw !== undefined && Number.isFinite(Number(raw))) thresholds[key] = Number(raw);
+    if (raw === undefined) continue;
+
+    const value = Number(raw);
+    if (!Number.isFinite(value)) {
+      console.error(`::warning::${envName}=${raw} is not a number; keeping ${thresholds[key]}m`);
+      continue;
+    }
+    // A zero or negative threshold is not "alert sooner", it is a division by
+    // zero: every finding fires and pins to the top escalation band, which is
+    // the sentinel screaming and therefore the sentinel ignored. Refuse it and
+    // say so, rather than obeying a value nobody can have meant.
+    if (value < MIN_THRESHOLD_MINUTES) {
+      console.error(
+        `::warning::${envName}=${raw} is below the ${MIN_THRESHOLD_MINUTES}m minimum; ignored, keeping ${thresholds[key]}m`,
+      );
+      continue;
+    }
+    thresholds[key] = value;
   }
   return thresholds;
 }
@@ -69,6 +88,9 @@ async function mapLimit(items, limit, worker) {
 class GitHub {
   constructor(token) {
     this.token = token;
+    // Every list read that hit its page cap, so a bounded read is legible as a
+    // bounded read instead of passing for full coverage.
+    this.truncations = [];
   }
 
   async getPage(url) {
@@ -101,6 +123,11 @@ class GitHub {
    *
    * Costs nothing on a quiet repo: a second request happens only when GitHub
    * actually advertises one.
+   *
+   * The page cap is a runaway guard, not a coverage decision. Stopping at it
+   * means the read is short and the answer may be wrong, so it is recorded and
+   * reported: a truncation nobody is told about reads exactly like a complete
+   * scan, which is the failure mode this whole workflow exists to catch.
    */
   async getAll(path, pick = (body) => body, maxPages = 20) {
     let url = `${API}${path}`;
@@ -110,6 +137,7 @@ class GitHub {
       items.push(...pick(body));
       url = /<([^>]+)>;\s*rel="next"/.exec(link ?? "")?.[1] ?? null;
     }
+    if (url) this.truncations.push(`${path} stopped at the ${maxPages}-page cap (${items.length} item(s) read, more available)`);
     return items;
   }
 }
@@ -211,20 +239,32 @@ async function collectDeployEvidence(gh, repo, errors) {
   const environment = env("SENTINEL_DEPLOY_ENVIRONMENT");
   if (!workflow && !environment) return { enabled: false, source: "none", successfulShas: [] };
 
+  // Deploy evidence is a membership test: a merge sha either appears among the
+  // successful deploys or it does not. Reading one page made a miss silent —
+  // a busy repository pushes the sha off page 1 and the merge is reported as
+  // never served. These walk the pages, and `getAll` reports the cap if the
+  // history is deeper still. The cap is lower than the default: this only has
+  // to reach back as far as MERGED_LOOKBACK_MINUTES, not to the beginning.
+  const DEPLOY_MAX_PAGES = 5;
+
   try {
     if (workflow) {
-      const runs = await gh.get(
+      const runs = await gh.getAll(
         `/repos/${repo}/actions/workflows/${encodeURIComponent(workflow)}/runs?status=success&per_page=100`,
+        (body) => body.workflow_runs ?? [],
+        DEPLOY_MAX_PAGES,
       );
       return {
         enabled: true,
         source: `workflow:${workflow}`,
-        successfulShas: (runs.workflow_runs ?? []).map((run) => run.head_sha),
+        successfulShas: runs.map((run) => run.head_sha),
       };
     }
 
-    const deployments = await gh.get(
+    const deployments = await gh.getAll(
       `/repos/${repo}/deployments?environment=${encodeURIComponent(environment)}&per_page=100`,
+      (body) => body,
+      DEPLOY_MAX_PAGES,
     );
     const shas = [];
     for (const deployment of deployments) {
@@ -300,13 +340,32 @@ function renderReport(repo, alerts) {
   ].join("\n");
 }
 
+/**
+ * One egress, fanned out server-side.
+ *
+ * This runs on a GitHub-hosted runner, off our network, so it can only talk to
+ * what is publicly reachable: the Paperclip API sits behind Cloudflare Access
+ * and answers an off-host POST with a redirect to a login page no token can
+ * satisfy, and a Discord webhook is anonymous by construction. Orchestra is
+ * reachable and can address both from inside, so the public repository holds
+ * exactly one credential and its whole power is "file a sentinel alert".
+ *
+ * The contract is frozen with the ingest side: 202 means accepted, and
+ * anything else — including a redirect that resolves to a cheerful 200 on some
+ * login page — is a delivery failure, which is why the check is on the exact
+ * status rather than on `response.ok`.
+ *
+ * Accepted is not yet delivered. The ingest fans out to two independent legs
+ * and neither is allowed to fail the other, so it answers 202 and names the
+ * legs that actually landed in `delivered`. An empty list means the alert was
+ * accepted and then reached nobody — which, taken as success, would advance
+ * the ledger and leave the finding spoken exactly zero times: the sentinel
+ * failing in the one way it exists to catch. So an empty list is a delivery
+ * failure. A body without the field is left alone: that is the frozen contract
+ * as written, and this must not break on an ingest that only promises 202.
+ */
 async function deliver(repo, alerts, dryRun) {
   const report = renderReport(repo, alerts);
-  const delivered = [];
-
-  const paperclipUrl = env("SENTINEL_PAPERCLIP_ISSUE_URL");
-  const paperclipToken = env("SENTINEL_PAPERCLIP_TOKEN");
-  const discordUrl = env("SENTINEL_DISCORD_WEBHOOK_URL");
 
   if (dryRun) {
     console.log("--- dry run, nothing delivered ---");
@@ -314,52 +373,57 @@ async function deliver(repo, alerts, dryRun) {
     return ["dry-run"];
   }
 
-  if (paperclipUrl) {
-    try {
-      const response = await fetch(paperclipUrl, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          ...(paperclipToken ? { authorization: `Bearer ${paperclipToken}` } : {}),
-        },
-        body: JSON.stringify({
-          title: `[sentinel] ${alerts.length} silent failure(s) on ${repo}`,
-          description: report,
-          priority: "high",
-        }),
-      });
-      if (!response.ok) throw new Error(`${response.status} ${(await response.text()).slice(0, 200)}`);
-      delivered.push("paperclip");
-    } catch (error) {
-      console.error(`::warning::paperclip sink failed: ${error.message}`);
-    }
-  } else {
-    console.log("::notice::paperclip sink not configured (SENTINEL_PAPERCLIP_ISSUE_URL)");
+  const ingestUrl = env("SENTINEL_INGEST_URL");
+  const ingestKey = env("SENTINEL_INGEST_KEY");
+
+  // An unset recipient turns the sink off and the run says so, rather than
+  // failing as though something broke.
+  if (!ingestUrl) {
+    console.log("::notice::alert ingest not configured (SENTINEL_INGEST_URL); nothing delivered");
+    return [];
+  }
+  if (!ingestKey) {
+    console.log("::notice::alert ingest has no key (SENTINEL_INGEST_KEY); nothing delivered");
+    return [];
   }
 
-  if (discordUrl) {
-    try {
-      const response = await fetch(discordUrl, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          // Discord hard-caps a message at 2000 characters.
-          content: report.slice(0, 1900),
-          // Server-side authority over mentions: a PR title carried in this
-          // body must never be able to page the whole channel.
-          allowed_mentions: { parse: [] },
-        }),
-      });
-      if (!response.ok) throw new Error(`${response.status}`);
-      delivered.push("discord");
-    } catch (error) {
-      console.error(`::warning::discord sink failed: ${error.message}`);
+  try {
+    const response = await fetch(ingestUrl, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: `Bearer ${ingestKey}`,
+      },
+      body: JSON.stringify({
+        title: `[sentinel] ${alerts.length} silent failure(s) on ${neutralize(repo)}`,
+        description: report,
+        priority: "high",
+        repo,
+      }),
+    });
+    if (response.status !== 202) {
+      throw new Error(`${response.status} ${(await response.text()).slice(0, 200)}`);
     }
-  } else {
-    console.log("::notice::discord sink not configured (SENTINEL_DISCORD_WEBHOOK_URL)");
-  }
 
-  return delivered;
+    const body = await response.json().catch(() => null);
+    const legs = Array.isArray(body?.delivered) ? body.delivered.map(String) : null;
+    if (legs === null) return ["orchestra"];
+    if (legs.length === 0) {
+      throw new Error(`202 accepted but delivered to no leg: ${JSON.stringify(body).slice(0, 200)}`);
+    }
+    // A partial fan-out still reached somebody, so the finding is announced and
+    // the ledger may advance — but the leg that failed is not allowed to pass
+    // in silence either.
+    for (const [name, leg] of Object.entries(body ?? {})) {
+      if (name !== "delivered" && leg && typeof leg === "object" && leg.ok === false) {
+        console.error(`::warning::alert ingest leg '${name}' failed: ${leg.reason ?? "no reason given"}`);
+      }
+    }
+    return legs.map((leg) => `orchestra:${leg}`);
+  } catch (error) {
+    console.error(`::warning::alert ingest failed: ${error.message}`);
+    return [];
+  }
 }
 
 async function summarize(lines) {
@@ -378,12 +442,16 @@ async function main() {
   if (!repo) throw new Error("no repo: set SENTINEL_REPO or GITHUB_REPOSITORY");
 
   const thresholds = thresholdsFromEnv();
-  const { snapshot, errors } = await collectSnapshot(new GitHub(token), repo, thresholds);
+  const gh = new GitHub(token);
+  const { snapshot, errors } = await collectSnapshot(gh, repo, thresholds);
   const { findings, skipped } = evaluate(snapshot);
   const previous = await readState(statePath);
   const { alerts, resolved, nextState } = diffFindings(findings, previous, {
+    // A truncated list is a partial read like any other: what was not read
+    // cannot be treated as gone, so previously known fingerprints are carried
+    // forward instead of being cleared by an absence we did not observe.
     nowMs: snapshot.nowMs,
-    scanComplete: errors.length === 0,
+    scanComplete: errors.length === 0 && gh.truncations.length === 0,
   });
 
   console.log(
@@ -391,12 +459,17 @@ async function main() {
   );
   for (const entry of skipped) console.log(`::notice::skipped ${entry.condition}: ${entry.reason}`);
   for (const error of errors) console.error(`::warning::partial read: ${error}`);
+  for (const truncation of gh.truncations) console.error(`::warning::truncated read: ${truncation}`);
+
+  // The run summary must carry the same caveat as the log, or a reader who
+  // trusts it reads a bounded scan as a complete one.
+  const summaryLines = gh.truncations.map((truncation) => `> **Truncated read** — ${truncation}`);
 
   if (alerts.length > 0) {
     const delivered = await deliver(repo, alerts, dryRun);
     console.log(renderReport(repo, alerts));
     console.log(`delivered via: ${delivered.join(", ") || "nothing configured"}`);
-    await summarize([`### Silence sentinel — ${alerts.length} announced`, "", ...alerts.map(renderAlert)]);
+    summaryLines.unshift(`### Silence sentinel — ${alerts.length} announced`, "", ...alerts.map(renderAlert), "");
 
     if (!dryRun && delivered.length === 0) {
       // Nobody was told, so nothing may be recorded as told. Writing these
@@ -419,6 +492,8 @@ async function main() {
     // The empty run is the common case and it says nothing anywhere.
     console.log("silence is clean: nothing new, nothing worsening");
   }
+
+  if (summaryLines.length > 0) await summarize(summaryLines);
 
   if (!dryRun) await writeState(statePath, nextState);
 }
