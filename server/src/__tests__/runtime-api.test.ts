@@ -17,6 +17,34 @@ describe("runtime API discovery", () => {
     ).toBe("https://paperclip.example.com");
   });
 
+  it("lets an explicit runtime API pin outrank the public base URL", () => {
+    // Regression (FIG-721): the public hostname can sit behind an edge auth layer
+    // (Cloudflare Access) that 302s bearer-token calls to an SSO page. The operator
+    // pins the loopback listener for locally-executed agents while the public base
+    // URL stays set for browser auth, so the pin must win.
+    expect(
+      choosePrimaryRuntimeApiUrl({
+        explicitRuntimeApiUrl: "http://127.0.0.1:3101",
+        authPublicBaseUrl: "https://agents.example.com",
+        allowedHostnames: ["agents.example.com", "127.0.0.1"],
+        bindHost: "127.0.0.1",
+        port: 3101,
+      }),
+    ).toBe("http://127.0.0.1:3101");
+  });
+
+  it("falls back to the derived origin when the explicit runtime API pin is malformed", () => {
+    expect(
+      choosePrimaryRuntimeApiUrl({
+        explicitRuntimeApiUrl: "not-a-url",
+        authPublicBaseUrl: "https://agents.example.com",
+        allowedHostnames: ["agents.example.com"],
+        bindHost: "0.0.0.0",
+        port: 3101,
+      }),
+    ).toBe("https://agents.example.com");
+  });
+
   it("prefers the loopback bind host over allowed hostnames for the primary runtime URL", () => {
     expect(
       choosePrimaryRuntimeApiUrl({
