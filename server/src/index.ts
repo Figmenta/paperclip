@@ -712,7 +712,13 @@ export async function startServer(): Promise<StartedServer> {
   }
   
   const runtimeListenHost = config.host;
+  // Read the operator's pin before it is overwritten below, so an explicit
+  // PAPERCLIP_RUNTIME_API_URL survives startup instead of being replaced by the
+  // derived public origin (which may sit behind an edge auth layer that bearer
+  // run JWTs cannot traverse).
+  const explicitRuntimeApiUrl = process.env.PAPERCLIP_RUNTIME_API_URL?.trim() || null;
   const runtimeApiUrl = choosePrimaryRuntimeApiUrl({
+    explicitRuntimeApiUrl,
     authPublicBaseUrl: config.authPublicBaseUrl ?? null,
     allowedHostnames: config.allowedHostnames,
     bindHost: runtimeListenHost,
