@@ -47,11 +47,26 @@ function pushCandidate(
 }
 
 export function choosePrimaryRuntimeApiUrl(input: {
+  explicitRuntimeApiUrl?: string | null;
   authPublicBaseUrl?: string | null;
   allowedHostnames: string[];
   bindHost: string;
   port: number;
 }): string {
+  // An operator-set runtime API URL is a deliberate pin and outranks the derived
+  // public origin. Locally-executed agents authenticate with bearer run JWTs, which
+  // cannot traverse an edge auth layer (e.g. Cloudflare Access) fronting the public
+  // hostname: that layer answers 302-to-SSO instead of honouring the token. The
+  // public base URL must stay set for browser auth, so the two cannot be collapsed.
+  const explicitRuntimeApiUrl = input.explicitRuntimeApiUrl?.trim();
+  if (explicitRuntimeApiUrl) {
+    try {
+      return new URL(explicitRuntimeApiUrl).origin;
+    } catch {
+      // Malformed pin: fall through to the derived candidates rather than crash.
+    }
+  }
+
   const explicitPublicBaseUrl = input.authPublicBaseUrl?.trim();
   if (explicitPublicBaseUrl) {
     try {
