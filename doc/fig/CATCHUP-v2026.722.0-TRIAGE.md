@@ -420,6 +420,12 @@ still takes no operator-pin input, and `server/src/index.ts:731` still overwrite
   `runtime-api`, `adapter-registry`, `heartbeat-model-profile` (33 tests).
 - `issue-delete-fk-coverage` demonstrated red on this base BEFORE the `remove()` change and
   green after — the §7 acceptance signal, in both directions.
+- §7's *behaviour* is pinned separately by the new `issue-delete-skill-test-run.test.ts`
+  (DB-backed: a TypeScript re-implementation of a RESTRICT rule could only agree with the
+  code). With the `remove()` block deleted, both cases fail with Postgres stating the premise
+  verbatim — `update or delete on table "issues" violates RESTRICT setting of foreign key
+  constraint "company_skill_test_runs_issue_id_issues_id_fk"` — which is the predicted 500,
+  observed rather than inferred.
 - The 5 fig tests inside `heartbeat-process-recovery` green and deterministic across repeated
   runs; the 3 fig `board_key` tests inside `issue-comment-reopen-routes` green.
 - **Pre-existing, not caused by the port:** both of those upstream suites have floating ~5s
