@@ -415,6 +415,18 @@ export function classifyAdapterFailureForRecovery(
   };
 }
 
+// FIG-132: bound `unassigned_blocker_recovery`. Unlike the transient-retry and
+// run-liveness-continuation paths, this reconcile had no attempt counter, no
+// backoff and no per-issue cap, so every tick that saw the orphan-blocker
+// condition re-assigned + re-enqueued a wake — the re-spawn half of the FIG-131
+// loop. The attempt count is derived from prior `unassigned_blocker_recovery`
+// wakes for the issue (no schema change), gated by exponential backoff, and
+// escalated once exhausted instead of re-spawning.
+const UNASSIGNED_BLOCKER_RECOVERY_MAX_ATTEMPTS = 3;
+const UNASSIGNED_BLOCKER_RECOVERY_BASE_BACKOFF_MS = 5 * 60 * 1000;
+const UNASSIGNED_BLOCKER_RECOVERY_ESCALATION_MARKER =
+  "<!-- recovery:unassigned_blocker_recovery:exhausted -->";
+
 type ContinuationRetryClassification = {
   kind: "transient_infra" | "non_retryable" | "default";
   maxAttempts: number;
@@ -1113,8 +1125,11 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
 
     let assigned = 0;
     let skipped = 0;
+    let escalated = 0;
+    let backedOff = 0;
     const issueIds: string[] = [];
     const seen = new Set<string>();
+    const now = new Date();
 
     for (const candidate of candidates) {
       if (seen.has(candidate.id)) continue;
@@ -1129,6 +1144,41 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       if (!creatorAgent || creatorAgent.companyId !== candidate.companyId || !(await isAgentInvokable(creatorAgent))) {
         skipped += 1;
         continue;
+      }
+
+      // FIG-132: bound the re-spawn. Count prior recovery wakes for this issue and
+      // apply an exponential backoff; escalate once the cap is reached.
+      const priorWakes = await db
+        .select({ createdAt: agentWakeupRequests.createdAt, requestedAt: agentWakeupRequests.requestedAt })
+        .from(agentWakeupRequests)
+        .where(
+          and(
+            eq(agentWakeupRequests.companyId, candidate.companyId),
+            sql`${agentWakeupRequests.payload}->>'mutation' = 'unassigned_blocker_recovery'`,
+            sql`${agentWakeupRequests.payload}->>'issueId' = ${candidate.id}`,
+          ),
+        )
+        .orderBy(desc(agentWakeupRequests.createdAt));
+      const attemptCount = priorWakes.length;
+
+      if (attemptCount >= UNASSIGNED_BLOCKER_RECOVERY_MAX_ATTEMPTS) {
+        const escalatedNow = await escalateExhaustedUnassignedBlockerRecovery(candidate, attemptCount);
+        if (escalatedNow) escalated += 1;
+        else skipped += 1;
+        continue;
+      }
+
+      if (attemptCount > 0) {
+        const lastWake = priorWakes[0];
+        const lastAttemptMs = Math.max(
+          lastWake?.createdAt ? new Date(lastWake.createdAt).getTime() : 0,
+          lastWake?.requestedAt ? new Date(lastWake.requestedAt).getTime() : 0,
+        );
+        const backoffMs = UNASSIGNED_BLOCKER_RECOVERY_BASE_BACKOFF_MS * 2 ** (attemptCount - 1);
+        if (lastAttemptMs > 0 && now.getTime() - lastAttemptMs < backoffMs) {
+          backedOff += 1;
+          continue;
+        }
       }
 
       const relations = await issuesSvc.getRelationSummaries(candidate.id);
@@ -1197,7 +1247,62 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       }
     }
 
-    return { assigned, skipped, issueIds };
+    return { assigned, skipped, escalated, backedOff, issueIds };
+  }
+
+  // FIG-132: on exhaustion, escalate the orphan blocker for human/manager handling
+  // instead of re-spawning another recovery wake. Idempotent — a single escalation
+  // comment per issue (guarded by a hidden marker), so a still-unassigned issue that
+  // keeps re-matching the reconcile query does not spam the thread.
+  async function escalateExhaustedUnassignedBlockerRecovery(
+    candidate: { id: string; companyId: string; identifier: string | null },
+    attemptCount: number,
+  ) {
+    const alreadyEscalated = await db
+      .select({ id: issueComments.id, body: issueComments.body })
+      .from(issueComments)
+      .where(
+        and(
+          eq(issueComments.issueId, candidate.id),
+          eq(issueComments.authorType, "system"),
+        ),
+      )
+      .orderBy(desc(issueComments.createdAt))
+      .limit(50)
+      .then((rows) => rows.some((row) => (row.body ?? "").includes(UNASSIGNED_BLOCKER_RECOVERY_ESCALATION_MARKER)));
+    if (alreadyEscalated) return false;
+
+    await issuesSvc.addComment(
+      candidate.id,
+      [
+        "## Orphan Blocker Recovery Exhausted",
+        "",
+        `Paperclip re-assigned this unassigned blocker to its creating agent ${attemptCount} time(s) without it being resolved, so automatic recovery has stopped to avoid an assignment/wake loop.`,
+        "",
+        "- Next action: a human or manager should resolve this blocker, assign it to the right owner, or mark it done/cancelled.",
+        UNASSIGNED_BLOCKER_RECOVERY_ESCALATION_MARKER,
+      ].join("\n"),
+      {},
+      { authorType: "system" },
+    );
+
+    await logActivity(db, {
+      companyId: candidate.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.updated",
+      entityType: "issue",
+      entityId: candidate.id,
+      details: {
+        identifier: candidate.identifier,
+        source: "recovery.reconcile_unassigned_blocking_issue_exhausted",
+        attemptCount,
+      },
+    });
+
+    return true;
   }
 
   async function getCompanyIssuePrefix(companyId: string) {
@@ -4118,6 +4223,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const orphanBlockerRecovery = await reconcileUnassignedBlockingIssues();
     result.orphanBlockersAssigned = orphanBlockerRecovery.assigned;
     result.skipped += orphanBlockerRecovery.skipped;
+    result.escalated += orphanBlockerRecovery.escalated;
     result.issueIds.push(...orphanBlockerRecovery.issueIds);
 
     return result;
