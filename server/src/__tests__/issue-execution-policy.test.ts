@@ -1619,3 +1619,235 @@ describe("issue execution policy transitions", () => {
     });
   });
 });
+
+const writerAgentId = "44444444-4444-4444-8444-444444444444";
+const proofreaderAgentId = "55555555-5555-4555-8555-555555555555";
+
+/**
+ * The multi-actor shape this capability exists for: the issue is assigned to the designer
+ * (the executor of record), a writer stage runs after them, and a proofreader stage runs
+ * last. A rejection by the proofreader belongs to the writer — a slot that is not the first.
+ */
+function docWritingPolicy(opts: { perStageReturn: boolean }) {
+  return normalizeIssueExecutionPolicy({
+    stages: [
+      { type: "review", participants: [{ type: "agent", agentId: writerAgentId }] },
+      {
+        type: "review",
+        participants: [{ type: "agent", agentId: proofreaderAgentId }],
+        ...(opts.perStageReturn ? { returnTo: { type: "agent", agentId: writerAgentId } } : {}),
+      },
+    ],
+  })!;
+}
+
+function rejectAtProofreadStage(policy: IssueExecutionPolicy) {
+  return applyIssueExecutionPolicyTransition({
+    issue: {
+      status: "in_review",
+      assigneeAgentId: proofreaderAgentId,
+      assigneeUserId: null,
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: policy.stages[1].id,
+        currentStageIndex: 1,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: proofreaderAgentId },
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+        completedStageIds: [policy.stages[0].id],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    },
+    policy,
+    requestedStatus: "in_progress",
+    requestedAssigneePatch: {},
+    actor: { agentId: proofreaderAgentId },
+    commentBody: "The copy contradicts the brief in section two",
+  });
+}
+
+describe("per-stage return target", () => {
+  it("without a per-stage target the rejection is identical to today: it returns to the executor", () => {
+    const policy = docWritingPolicy({ perStageReturn: false });
+    expect(policy.stages[1].returnTo).toBeUndefined();
+
+    const result = rejectAtProofreadStage(policy);
+
+    expect(result.patch.status).toBe("in_progress");
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+    expect(result.patch.executionState).toMatchObject({
+      status: "changes_requested",
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+    });
+  });
+
+  it("a stage that names its own target sends the rejection to a slot that is not the first", () => {
+    const policy = docWritingPolicy({ perStageReturn: true });
+    expect(policy.stages[1].returnTo).toEqual({ type: "agent", agentId: writerAgentId, userId: null });
+
+    const result = rejectAtProofreadStage(policy);
+
+    expect(result.patch.status).toBe("in_progress");
+    expect(result.patch.assigneeAgentId).toBe(writerAgentId);
+    expect(result.decision).toMatchObject({
+      stageId: policy.stages[1].id,
+      stageType: "review",
+      outcome: "changes_requested",
+    });
+    // The wake for `changes_requested` is routed off `executionState.returnAssignee`
+    // (`routes/issues.ts`), so the arc only actually reaches the writer if the state carries it.
+    expect(result.patch.executionState).toMatchObject({
+      status: "changes_requested",
+      currentStageId: policy.stages[1].id,
+      returnAssignee: { type: "agent", agentId: writerAgentId, userId: null },
+      lastDecisionOutcome: "changes_requested",
+    });
+  });
+
+  it("the writer's re-submission re-enters the proofread stage, not the stage before it", () => {
+    const policy = docWritingPolicy({ perStageReturn: true });
+    const rejected = rejectAtProofreadStage(policy);
+    const rejectedState = rejected.patch.executionState as IssueExecutionState;
+
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: writerAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: rejectedState,
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: writerAgentId },
+      commentBody: "Section two rewritten against the brief",
+    });
+
+    expect(result.patch.status).toBe("in_review");
+    expect(result.patch.assigneeAgentId).toBe(proofreaderAgentId);
+    expect(result.patch.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: policy.stages[1].id,
+      currentParticipant: { type: "agent", agentId: proofreaderAgentId },
+    });
+  });
+
+  it("a user can be a per-stage return target", () => {
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        { type: "review", participants: [{ type: "user", userId: boardUserId }] },
+        {
+          type: "approval",
+          participants: [{ type: "user", userId: ctoUserId }],
+          returnTo: { type: "user", userId: boardUserId },
+        },
+      ],
+    })!;
+
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: null,
+        assigneeUserId: ctoUserId,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: policy.stages[1].id,
+          currentStageIndex: 1,
+          currentStageType: "approval",
+          currentParticipant: { type: "user", userId: ctoUserId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          completedStageIds: [policy.stages[0].id],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      },
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { userId: ctoUserId },
+      commentBody: "Back to the board for a rewrite",
+    });
+
+    expect(result.patch.assigneeUserId).toBe(boardUserId);
+    expect(result.patch.assigneeAgentId).toBeNull();
+  });
+});
+
+describe("per-stage return target authoring guard", () => {
+  it("refuses an arc that leaves the declaring stage with no eligible participant", () => {
+    expect(() =>
+      normalizeIssueExecutionPolicy({
+        stages: [
+          { type: "review", participants: [{ type: "agent", agentId: writerAgentId }] },
+          {
+            type: "review",
+            participants: [{ type: "agent", agentId: proofreaderAgentId }],
+            // The proofreader hands the work back to themselves: on the re-submission the
+            // engine excludes them from their own stage and nobody is left to proofread.
+            returnTo: { type: "agent", agentId: proofreaderAgentId },
+          },
+        ],
+      }),
+    ).toThrow("Invalid execution policy");
+  });
+
+  it("refuses an arc that strands a later stage", () => {
+    expect(() =>
+      normalizeIssueExecutionPolicy({
+        stages: [
+          {
+            type: "review",
+            participants: [{ type: "agent", agentId: writerAgentId }],
+            returnTo: { type: "agent", agentId: proofreaderAgentId },
+          },
+          { type: "review", participants: [{ type: "agent", agentId: proofreaderAgentId }] },
+        ],
+      }),
+    ).toThrow("Invalid execution policy");
+  });
+
+  it("accepts the same arc one participant away from stranding", () => {
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          type: "review",
+          participants: [{ type: "agent", agentId: writerAgentId }],
+          returnTo: { type: "agent", agentId: proofreaderAgentId },
+        },
+        {
+          type: "review",
+          participants: [
+            { type: "agent", agentId: proofreaderAgentId },
+            { type: "agent", agentId: qaAgentId },
+          ],
+        },
+      ],
+    })!;
+    expect(policy.stages[0].returnTo).toEqual({ type: "agent", agentId: proofreaderAgentId, userId: null });
+  });
+
+  it("does not police stages before the declaring one: they are already completed when the arc fires", () => {
+    const policy = docWritingPolicy({ perStageReturn: true });
+    expect(policy.stages[0].participants).toHaveLength(1);
+    expect(policy.stages[0].participants[0].agentId).toBe(writerAgentId);
+    expect(policy.stages[1].returnTo).toEqual({ type: "agent", agentId: writerAgentId, userId: null });
+  });
+
+  it("rejects a malformed return target", () => {
+    expect(() =>
+      normalizeIssueExecutionPolicy({
+        stages: [
+          {
+            type: "review",
+            participants: [{ type: "agent", agentId: qaAgentId }],
+            returnTo: { type: "agent", userId: ctoUserId },
+          },
+        ],
+      }),
+    ).toThrow("Invalid execution policy");
+  });
+});
