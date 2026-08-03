@@ -412,6 +412,14 @@ export interface IssueExecutionState {
   currentStageType: IssueExecutionStageType | null;
   currentParticipant: IssueExecutionStagePrincipal | null;
   returnAssignee: IssueExecutionStagePrincipal | null;
+  /**
+   * Where *this* rejection sent the work, when the rejecting stage named its own target
+   * (`stage.returnTo`). It is part of the decision record, alongside `lastDecisionOutcome`:
+   * it never replaces `returnAssignee`, which stays the workflow-wide fallback every other
+   * stage keeps falling back to, and which is the principal the engine excludes from
+   * reviewing its own work.
+   */
+  stageReturnAssignee?: IssueExecutionStagePrincipal | null;
   reviewRequest: IssueReviewRequest | null;
   completedStageIds: string[];
   lastDecisionId: string | null;

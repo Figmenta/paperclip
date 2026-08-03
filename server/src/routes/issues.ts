@@ -103,6 +103,7 @@ import {
 } from "../services/company-search-rate-limit.js";
 import {
   applyIssueExecutionPolicyTransition,
+  executionReturnTarget,
   normalizeIssueExecutionPolicy,
   parseIssueExecutionState,
   redactIssueMonitorExternalRef,
@@ -480,7 +481,9 @@ function buildExecutionStageWakeContext(input: {
     stageId: input.state.currentStageId,
     stageType: input.state.currentStageType,
     currentParticipant: input.state.currentParticipant,
-    returnAssignee: input.state.returnAssignee,
+    // Where the work sits now: the arc target when a per-stage one fired, the workflow-wide
+    // return assignee otherwise.
+    returnAssignee: executionReturnTarget(input.state),
     reviewRequest: input.state.reviewRequest ?? null,
     lastDecisionOutcome: input.state.lastDecisionOutcome,
     allowedActions: input.allowedActions,
@@ -775,11 +778,12 @@ function buildExecutionStageWakeup(input: {
   }
 
   if (nextState.status === "changes_requested") {
-    const agentId = nextState.returnAssignee?.type === "agent" ? (nextState.returnAssignee.agentId ?? null) : null;
+    const returnTarget = executionReturnTarget(nextState);
+    const agentId = returnTarget?.type === "agent" ? (returnTarget.agentId ?? null) : null;
     const becameChangesRequested =
       previousState?.status !== "changes_requested" ||
       previousState?.lastDecisionId !== nextState.lastDecisionId ||
-      !executionPrincipalsEqual(previousState?.returnAssignee ?? null, nextState.returnAssignee ?? null);
+      !executionPrincipalsEqual(executionReturnTarget(previousState), returnTarget);
     if (!agentId || !becameChangesRequested) return null;
 
     const executionStage = buildExecutionStageWakeContext({
