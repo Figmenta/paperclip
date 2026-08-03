@@ -1619,3 +1619,401 @@ describe("issue execution policy transitions", () => {
     });
   });
 });
+
+const writerAgentId = "44444444-4444-4444-8444-444444444444";
+const proofreaderAgentId = "55555555-5555-4555-8555-555555555555";
+const editorAgentId = "66666666-6666-4666-8666-666666666666";
+
+/**
+ * The multi-actor shape this capability exists for: the issue is assigned to the designer
+ * (the executor of record), a writer stage runs after them, and a proofreader stage runs
+ * last. A rejection by the proofreader belongs to the writer — a slot that is not the first.
+ *
+ * `trailingStage` appends a third stage that declares nothing. That stage is where an arc
+ * that outlived the stage declaring it would show up: in where its own rejection goes, and
+ * in who is left eligible to staff it.
+ */
+function docWritingPolicy(opts: {
+  perStageReturn: boolean;
+  trailingStage?: Array<{ type: "agent"; agentId: string }>;
+}) {
+  return normalizeIssueExecutionPolicy({
+    stages: [
+      { type: "review", participants: [{ type: "agent", agentId: writerAgentId }] },
+      {
+        type: "review",
+        participants: [{ type: "agent", agentId: proofreaderAgentId }],
+        ...(opts.perStageReturn ? { returnTo: { type: "agent", agentId: writerAgentId } } : {}),
+      },
+      ...(opts.trailingStage ? [{ type: "review", participants: opts.trailingStage }] : []),
+    ],
+  })!;
+}
+
+/**
+ * The full round trip the arc opens: the proofreader rejects, the writer re-submits, the
+ * proofreader approves. Returns the transition that lands on the stage after the proofreader.
+ */
+function runArcAndApprove(policy: IssueExecutionPolicy) {
+  const rejected = rejectAtProofreadStage(policy);
+  const resubmitted = applyIssueExecutionPolicyTransition({
+    issue: {
+      status: "in_progress",
+      assigneeAgentId: writerAgentId,
+      assigneeUserId: null,
+      executionPolicy: policy,
+      executionState: rejected.patch.executionState as IssueExecutionState,
+    },
+    policy,
+    requestedStatus: "done",
+    requestedAssigneePatch: {},
+    actor: { agentId: writerAgentId },
+    commentBody: "Section two rewritten against the brief",
+  });
+
+  return applyIssueExecutionPolicyTransition({
+    issue: {
+      status: "in_review",
+      assigneeAgentId: proofreaderAgentId,
+      assigneeUserId: null,
+      executionPolicy: policy,
+      executionState: resubmitted.patch.executionState as IssueExecutionState,
+    },
+    policy,
+    requestedStatus: "done",
+    requestedAssigneePatch: {},
+    actor: { agentId: proofreaderAgentId },
+    commentBody: "Reads clean now",
+  });
+}
+
+function rejectAtProofreadStage(policy: IssueExecutionPolicy) {
+  return applyIssueExecutionPolicyTransition({
+    issue: {
+      status: "in_review",
+      assigneeAgentId: proofreaderAgentId,
+      assigneeUserId: null,
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: policy.stages[1].id,
+        currentStageIndex: 1,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: proofreaderAgentId },
+        returnAssignee: { type: "agent", agentId: coderAgentId },
+        completedStageIds: [policy.stages[0].id],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    },
+    policy,
+    requestedStatus: "in_progress",
+    requestedAssigneePatch: {},
+    actor: { agentId: proofreaderAgentId },
+    commentBody: "The copy contradicts the brief in section two",
+  });
+}
+
+describe("per-stage return target", () => {
+  it("without a per-stage target the rejection is identical to today: it returns to the executor", () => {
+    const policy = docWritingPolicy({ perStageReturn: false });
+    expect(policy.stages[1].returnTo).toBeUndefined();
+
+    const result = rejectAtProofreadStage(policy);
+
+    expect(result.patch.status).toBe("in_progress");
+    expect(result.patch.assigneeAgentId).toBe(coderAgentId);
+    expect(result.patch.executionState).toMatchObject({
+      status: "changes_requested",
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+    });
+  });
+
+  it("a stage that names its own target sends the rejection to a slot that is not the first", () => {
+    const policy = docWritingPolicy({ perStageReturn: true });
+    expect(policy.stages[1].returnTo).toEqual({ type: "agent", agentId: writerAgentId, userId: null });
+
+    const result = rejectAtProofreadStage(policy);
+
+    expect(result.patch.status).toBe("in_progress");
+    expect(result.patch.assigneeAgentId).toBe(writerAgentId);
+    expect(result.decision).toMatchObject({
+      stageId: policy.stages[1].id,
+      stageType: "review",
+      outcome: "changes_requested",
+    });
+    // The wake for `changes_requested` is routed off the state (`routes/issues.ts`), so the arc
+    // only actually reaches the writer if the state carries it — in its own slot. The
+    // workflow-wide `returnAssignee` is left exactly where it was: it is the fallback every
+    // other stage keeps using, and the principal the engine keeps out of judging its own work.
+    expect(result.patch.executionState).toMatchObject({
+      status: "changes_requested",
+      currentStageId: policy.stages[1].id,
+      stageReturnAssignee: { type: "agent", agentId: writerAgentId, userId: null },
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      lastDecisionOutcome: "changes_requested",
+    });
+    // The state is persisted as JSON and read back through the validator: the arc has to
+    // survive that round trip, or the wake reads a target that is no longer there.
+    expect(parseIssueExecutionState(JSON.parse(JSON.stringify(result.patch.executionState)))).toMatchObject({
+      stageReturnAssignee: { type: "agent", agentId: writerAgentId },
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+    });
+  });
+
+  it("the arc stays on its own stage: a later stage's rejection still goes to the executor", () => {
+    const policy = docWritingPolicy({
+      perStageReturn: true,
+      trailingStage: [{ type: "agent", agentId: editorAgentId }],
+    });
+
+    const onEditorStage = runArcAndApprove(policy);
+    expect(onEditorStage.patch.assigneeAgentId).toBe(editorAgentId);
+
+    const rejectedByEditor = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: editorAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: onEditorStage.patch.executionState as IssueExecutionState,
+      },
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { agentId: editorAgentId },
+      commentBody: "The layout no longer matches the brief",
+    });
+
+    // The editor stage declares no target, so its rejection goes where it went before
+    // per-stage targets existed — to the executor of record, not to the writer another
+    // stage's arc happened to name.
+    expect(rejectedByEditor.patch.assigneeAgentId).toBe(coderAgentId);
+    expect(rejectedByEditor.patch.executionState).toMatchObject({
+      status: "changes_requested",
+      returnAssignee: { type: "agent", agentId: coderAgentId },
+      stageReturnAssignee: null,
+    });
+  });
+
+  it("the arc does not un-exclude the executor from a later stage that lists them", () => {
+    // A final stage that lists the executor of record among its reviewers. The executor is
+    // excluded from it — the doer does not judge its own work — and firing an arc first must
+    // not change that.
+    const trailingStage = [
+      { type: "agent" as const, agentId: coderAgentId },
+      { type: "agent" as const, agentId: proofreaderAgentId },
+    ];
+    const control = docWritingPolicy({ perStageReturn: false, trailingStage });
+    const probe = docWritingPolicy({ perStageReturn: true, trailingStage });
+
+    const withoutArc = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: proofreaderAgentId,
+        assigneeUserId: null,
+        executionPolicy: control,
+        executionState: {
+          status: "pending",
+          currentStageId: control.stages[1].id,
+          currentStageIndex: 1,
+          currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: proofreaderAgentId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          completedStageIds: [control.stages[0].id],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      },
+      policy: control,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: proofreaderAgentId },
+      commentBody: "Reads clean",
+    });
+
+    const withArc = runArcAndApprove(probe);
+
+    expect(withoutArc.patch.assigneeAgentId).toBe(proofreaderAgentId);
+    expect(withArc.patch.assigneeAgentId).toBe(proofreaderAgentId);
+  });
+
+  it("a stage is never staffed by the principal it returns to", () => {
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          type: "review",
+          participants: [
+            { type: "agent", agentId: writerAgentId },
+            { type: "agent", agentId: proofreaderAgentId },
+          ],
+          returnTo: { type: "agent", agentId: writerAgentId },
+        },
+      ],
+    })!;
+
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: coderAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: null,
+      },
+      policy,
+      requestedStatus: "in_review",
+      requestedAssigneePatch: {},
+      actor: { agentId: coderAgentId },
+      commentBody: "Ready for review",
+    });
+
+    expect(result.patch.assigneeAgentId).toBe(proofreaderAgentId);
+  });
+
+  it("the writer's re-submission re-enters the proofread stage, not the stage before it", () => {
+    const policy = docWritingPolicy({ perStageReturn: true });
+    const rejected = rejectAtProofreadStage(policy);
+    const rejectedState = rejected.patch.executionState as IssueExecutionState;
+
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_progress",
+        assigneeAgentId: writerAgentId,
+        assigneeUserId: null,
+        executionPolicy: policy,
+        executionState: rejectedState,
+      },
+      policy,
+      requestedStatus: "done",
+      requestedAssigneePatch: {},
+      actor: { agentId: writerAgentId },
+      commentBody: "Section two rewritten against the brief",
+    });
+
+    expect(result.patch.status).toBe("in_review");
+    expect(result.patch.assigneeAgentId).toBe(proofreaderAgentId);
+    expect(result.patch.executionState).toMatchObject({
+      status: "pending",
+      currentStageId: policy.stages[1].id,
+      currentParticipant: { type: "agent", agentId: proofreaderAgentId },
+    });
+  });
+
+  it("a user can be a per-stage return target", () => {
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        { type: "review", participants: [{ type: "user", userId: boardUserId }] },
+        {
+          type: "approval",
+          participants: [{ type: "user", userId: ctoUserId }],
+          returnTo: { type: "user", userId: boardUserId },
+        },
+      ],
+    })!;
+
+    const result = applyIssueExecutionPolicyTransition({
+      issue: {
+        status: "in_review",
+        assigneeAgentId: null,
+        assigneeUserId: ctoUserId,
+        executionPolicy: policy,
+        executionState: {
+          status: "pending",
+          currentStageId: policy.stages[1].id,
+          currentStageIndex: 1,
+          currentStageType: "approval",
+          currentParticipant: { type: "user", userId: ctoUserId },
+          returnAssignee: { type: "agent", agentId: coderAgentId },
+          completedStageIds: [policy.stages[0].id],
+          lastDecisionId: null,
+          lastDecisionOutcome: null,
+        },
+      },
+      policy,
+      requestedStatus: "in_progress",
+      requestedAssigneePatch: {},
+      actor: { userId: ctoUserId },
+      commentBody: "Back to the board for a rewrite",
+    });
+
+    expect(result.patch.assigneeUserId).toBe(boardUserId);
+    expect(result.patch.assigneeAgentId).toBeNull();
+  });
+});
+
+describe("per-stage return target authoring guard", () => {
+  it("refuses an arc that leaves the declaring stage with no eligible participant", () => {
+    expect(() =>
+      normalizeIssueExecutionPolicy({
+        stages: [
+          { type: "review", participants: [{ type: "agent", agentId: writerAgentId }] },
+          {
+            type: "review",
+            participants: [{ type: "agent", agentId: proofreaderAgentId }],
+            // The proofreader hands the work back to themselves: on the re-submission the
+            // engine excludes them from their own stage and nobody is left to proofread.
+            returnTo: { type: "agent", agentId: proofreaderAgentId },
+          },
+        ],
+      }),
+    ).toThrow("Invalid execution policy");
+  });
+
+  it("accepts the same arc one participant away from stranding", () => {
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        { type: "review", participants: [{ type: "agent", agentId: writerAgentId }] },
+        {
+          type: "review",
+          participants: [
+            { type: "agent", agentId: proofreaderAgentId },
+            { type: "agent", agentId: qaAgentId },
+          ],
+          // One participant away from the refusal above: the stage returns to one of its own
+          // two participants, and the other one can still staff it.
+          returnTo: { type: "agent", agentId: proofreaderAgentId },
+        },
+      ],
+    })!;
+    expect(policy.stages[1].returnTo).toEqual({ type: "agent", agentId: proofreaderAgentId, userId: null });
+  });
+
+  it("does not police other stages: an arc constrains the stage that declares it and no other", () => {
+    // Stage 2's only participant is stage 1's return target. Nothing is stranded: stage 1's
+    // arc decides where a rejection *at stage 1* goes and who may staff *stage 1*, and stage
+    // 2 is staffed against the workflow-wide return assignee like any other stage.
+    const policy = normalizeIssueExecutionPolicy({
+      stages: [
+        {
+          type: "review",
+          participants: [{ type: "agent", agentId: writerAgentId }],
+          returnTo: { type: "agent", agentId: proofreaderAgentId },
+        },
+        { type: "review", participants: [{ type: "agent", agentId: proofreaderAgentId }] },
+      ],
+    })!;
+    expect(policy.stages[0].returnTo).toEqual({ type: "agent", agentId: proofreaderAgentId, userId: null });
+    expect(policy.stages[1].returnTo).toBeUndefined();
+  });
+
+  it("does not police stages before the declaring one: they are already completed when the arc fires", () => {
+    const policy = docWritingPolicy({ perStageReturn: true });
+    expect(policy.stages[0].participants).toHaveLength(1);
+    expect(policy.stages[0].participants[0].agentId).toBe(writerAgentId);
+    expect(policy.stages[1].returnTo).toEqual({ type: "agent", agentId: writerAgentId, userId: null });
+  });
+
+  it("rejects a malformed return target", () => {
+    expect(() =>
+      normalizeIssueExecutionPolicy({
+        stages: [
+          {
+            type: "review",
+            participants: [{ type: "agent", agentId: qaAgentId }],
+            returnTo: { type: "agent", userId: ctoUserId },
+          },
+        ],
+      }),
+    ).toThrow("Invalid execution policy");
+  });
+});

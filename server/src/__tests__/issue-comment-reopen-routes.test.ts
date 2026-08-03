@@ -2992,4 +2992,81 @@ describe.sequential("issue comment reopen routes", () => {
       }),
     ));
   });
+
+  it("wakes the stage's own return target, not the workflow return assignee", async () => {
+    const writerAgentId = "44444444-4444-4444-8444-444444444444";
+    const policy = await normalizePolicy({
+      stages: [
+        {
+          id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+          type: "review",
+          participants: [{ type: "agent", agentId: writerAgentId }],
+        },
+        {
+          id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          type: "review",
+          participants: [{ type: "agent", agentId: "33333333-3333-4333-8333-333333333333" }],
+          returnTo: { type: "agent", agentId: writerAgentId },
+        },
+      ],
+    })!;
+    const issue = {
+      ...makeIssue("todo"),
+      status: "in_review",
+      assigneeAgentId: "33333333-3333-4333-8333-333333333333",
+      executionPolicy: policy,
+      executionState: {
+        status: "pending",
+        currentStageId: policy.stages[1].id,
+        currentStageIndex: 1,
+        currentStageType: "review",
+        currentParticipant: { type: "agent", agentId: "33333333-3333-4333-8333-333333333333" },
+        returnAssignee: { type: "agent", agentId: "22222222-2222-4222-8222-222222222222" },
+        completedStageIds: [policy.stages[0].id],
+        lastDecisionId: null,
+        lastDecisionOutcome: null,
+      },
+    };
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(async (_id: string, patch: Record<string, unknown>) => ({
+      ...issue,
+      ...patch,
+      updatedAt: new Date(),
+    }));
+
+    const res = await request(
+      await installActor(createApp(), {
+        type: "agent",
+        agentId: "33333333-3333-4333-8333-333333333333",
+        companyId: "company-1",
+        runId: "run-3",
+      }),
+    )
+      .patch("/api/issues/11111111-1111-4111-8111-111111111111")
+      .send({
+        status: "in_progress",
+        comment: "Section two contradicts the brief",
+      });
+
+    expect(res.status).toBe(200);
+    expect(res.body.assigneeAgentId).toBe(writerAgentId);
+    await waitForWakeup(() => expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      writerAgentId,
+      expect.objectContaining({
+        reason: "execution_changes_requested",
+        payload: expect.objectContaining({
+          executionStage: expect.objectContaining({
+            wakeRole: "executor",
+            // The wake context carries where the work sits now — the arc target — while the
+            // state keeps the workflow-wide return assignee untouched underneath.
+            returnAssignee: { type: "agent", agentId: writerAgentId, userId: null },
+          }),
+        }),
+      }),
+    ));
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalledWith(
+      "22222222-2222-4222-8222-222222222222",
+      expect.objectContaining({ reason: "execution_changes_requested" }),
+    );
+  });
 });

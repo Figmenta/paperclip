@@ -183,6 +183,7 @@ export const issueExecutionStageSchema = z.object({
   type: z.enum(ISSUE_EXECUTION_STAGE_TYPES),
   approvalsNeeded: z.literal(1).optional().default(1),
   participants: z.array(issueExecutionStageParticipantSchema).default([]),
+  returnTo: issueExecutionStagePrincipalSchema.optional().nullable(),
 });
 
 export const issueExecutionMonitorPolicySchema = z.object({
@@ -234,6 +235,7 @@ export const issueExecutionStateSchema = z.object({
   currentStageType: z.enum(ISSUE_EXECUTION_STAGE_TYPES).nullable(),
   currentParticipant: issueExecutionStagePrincipalSchema.nullable(),
   returnAssignee: issueExecutionStagePrincipalSchema.nullable(),
+  stageReturnAssignee: issueExecutionStagePrincipalSchema.nullable().optional().default(null),
   reviewRequest: issueReviewRequestSchema.nullable().optional().default(null),
   completedStageIds: z.array(z.string().uuid()).default([]),
   lastDecisionId: z.string().uuid().nullable(),
