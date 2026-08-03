@@ -336,6 +336,60 @@ export function setIssueExecutionPolicyMonitorScheduledBy(
   };
 }
 
+function normalizeStageReturnTarget(
+  returnTo: { type: "agent" | "user"; agentId?: string | null; userId?: string | null } | null | undefined,
+): IssueExecutionStagePrincipal | null {
+  if (!returnTo) return null;
+  if (returnTo.type === "agent") {
+    return returnTo.agentId ? { type: "agent", agentId: returnTo.agentId, userId: null } : null;
+  }
+  return returnTo.userId ? { type: "user", agentId: null, userId: returnTo.userId } : null;
+}
+
+/**
+ * An authoring guard for the per-stage return target: a return arc the engine cannot
+ * honour is refused here, loudly, instead of being accepted and disregarded at runtime.
+ *
+ * Once a rejection at stage `i` fires its arc, the target becomes the state's
+ * `returnAssignee`, and the engine excludes the return assignee from participant selection
+ * (`selectStageParticipant({ exclude: returnAssignee })`). So every stage that can still run
+ * after the arc fires — stage `i` itself, which the re-submission re-enters, and every stage
+ * after it — must keep at least one participant that is not the target. A stage whose
+ * participants are *all* the target has nobody left to staff it: on the re-submission it is
+ * either swallowed as completed with nobody having reviewed anything
+ * (`canAutoSkipPendingStage`) or it throws mid-flow. Either way the authored stage never runs
+ * as drawn, which is the silent outcome this refusal exists to prevent.
+ *
+ * Stages *before* the declaring stage are not the rule's business: advancement is
+ * forward-only, so they are already completed when the arc fires and never re-run. That is
+ * what makes the ordinary shape legal — a writer stage followed by a proofreader stage that
+ * returns to the writer.
+ */
+function assertStageReturnTargetsHonourable(stages: IssueExecutionStage[]) {
+  for (const [declaringIndex, declaringStage] of stages.entries()) {
+    const target = declaringStage.returnTo ?? null;
+    if (!target) continue;
+
+    for (let index = declaringIndex; index < stages.length; index += 1) {
+      const stage = stages[index]!;
+      if (stage.participants.length === 0) continue;
+      if (!stage.participants.every((participant) => principalsEqual(participant, target))) continue;
+      throw unprocessable("Invalid execution policy", {
+        formErrors: [
+          `Stage ${declaringIndex + 1} returns to ${describePrincipal(target)}, which leaves stage ` +
+            `${index + 1} (${stage.type}) with no eligible participant: the engine excludes the return ` +
+            "target from participant selection, so that stage would never run as authored.",
+        ],
+        fieldErrors: {},
+      });
+    }
+  }
+}
+
+function describePrincipal(principal: IssueExecutionStagePrincipal): string {
+  return principal.type === "agent" ? `agent ${principal.agentId}` : `user ${principal.userId}`;
+}
+
 export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPolicy | null {
   if (input == null) return null;
   const parsed = issueExecutionPolicySchema.safeParse(input);
@@ -364,14 +418,18 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
       }
 
       if (dedupedParticipants.length === 0) return null;
+      const returnTo = normalizeStageReturnTarget(stage.returnTo);
       return {
         id: stage.id ?? randomUUID(),
         type: stage.type,
         approvalsNeeded: 1 as const,
         participants: dedupedParticipants,
+        ...(returnTo ? { returnTo } : {}),
       };
     })
     .filter((stage): stage is NonNullable<typeof stage> => stage !== null);
+
+  assertStageReturnTargetsHonourable(stages);
 
   const monitor = parsed.data.monitor
     ? {
@@ -547,15 +605,32 @@ function buildPendingState(input: {
   };
 }
 
-function buildChangesRequestedState(previous: IssueExecutionState, currentStage: IssueExecutionStage): IssueExecutionState {
+function buildChangesRequestedState(
+  previous: IssueExecutionState,
+  currentStage: IssueExecutionStage,
+  returnAssignee: IssueExecutionStagePrincipal,
+): IssueExecutionState {
   return {
     ...previous,
     status: CHANGES_REQUESTED_STATUS,
     currentStageId: currentStage.id,
     currentStageType: currentStage.type,
+    returnAssignee,
     reviewRequest: null,
     lastDecisionOutcome: "changes_requested",
   };
+}
+
+/**
+ * Who a rejection at this stage sends the issue back to. A stage may name its own target
+ * (`stage.returnTo`); with no target declared this is the workflow-wide return assignee,
+ * which is the only behaviour that existed before per-stage targets.
+ */
+function stageReturnTarget(
+  stage: IssueExecutionStage,
+  state: IssueExecutionState | null,
+): IssueExecutionStagePrincipal | null {
+  return stage.returnTo ?? state?.returnAssignee ?? null;
 }
 
 function buildPendingStagePatch(input: {
@@ -747,12 +822,13 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
         if (!input.commentBody?.trim()) {
           throw unprocessable("Requesting changes requires a comment");
         }
-        if (!existingState?.returnAssignee) {
+        const returnTarget = stageReturnTarget(activeStage, existingState ?? null);
+        if (!existingState || !returnTarget) {
           throw unprocessable("This execution stage has no return assignee");
         }
         patch.status = "in_progress";
-        Object.assign(patch, patchForPrincipal(existingState.returnAssignee));
-        patch.executionState = buildChangesRequestedState(existingState, activeStage);
+        Object.assign(patch, patchForPrincipal(returnTarget));
+        patch.executionState = buildChangesRequestedState(existingState, activeStage, returnTarget);
         return {
           patch,
           decision: {

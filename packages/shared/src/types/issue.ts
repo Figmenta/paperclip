@@ -357,6 +357,12 @@ export interface IssueExecutionStage {
   type: IssueExecutionStageType;
   approvalsNeeded: 1;
   participants: IssueExecutionStageParticipant[];
+  /**
+   * Where a rejection at this stage sends the issue back to. When absent the
+   * rejection falls back to the workflow-wide `returnAssignee`, which is the
+   * behaviour every policy authored before this field had.
+   */
+  returnTo?: IssueExecutionStagePrincipal | null;
 }
 
 export interface IssueExecutionMonitorPolicy {

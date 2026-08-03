@@ -178,6 +178,7 @@ export const issueExecutionStageSchema = z.object({
   type: z.enum(ISSUE_EXECUTION_STAGE_TYPES),
   approvalsNeeded: z.literal(1).optional().default(1),
   participants: z.array(issueExecutionStageParticipantSchema).default([]),
+  returnTo: issueExecutionStagePrincipalSchema.optional().nullable(),
 });
 
 export const issueExecutionMonitorPolicySchema = z.object({
