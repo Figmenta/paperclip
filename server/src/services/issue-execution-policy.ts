@@ -111,6 +111,7 @@ function blankExecutionState(): IssueExecutionState {
     currentStageType: null,
     currentParticipant: null,
     returnAssignee: null,
+    stageReturnAssignee: null,
     reviewRequest: null,
     completedStageIds: [],
     lastDecisionId: null,
@@ -350,39 +351,32 @@ function normalizeStageReturnTarget(
  * An authoring guard for the per-stage return target: a return arc the engine cannot
  * honour is refused here, loudly, instead of being accepted and disregarded at runtime.
  *
- * Once a rejection at stage `i` fires its arc, the target becomes the state's
- * `returnAssignee`, and the engine excludes the return assignee from participant selection
- * (`selectStageParticipant({ exclude: returnAssignee })`). So every stage that can still run
- * after the arc fires — stage `i` itself, which the re-submission re-enters, and every stage
- * after it — must keep at least one participant that is not the target. A stage whose
- * participants are *all* the target has nobody left to staff it: on the re-submission it is
- * either swallowed as completed with nobody having reviewed anything
- * (`canAutoSkipPendingStage`) or it throws mid-flow. Either way the authored stage never runs
- * as drawn, which is the silent outcome this refusal exists to prevent.
+ * A stage never staffs its own return target (`selectStageParticipant` excludes it), because
+ * that principal is the one this stage hands rejected work to. So a stage whose participants
+ * are *all* its own return target has nobody left to staff it: it either throws mid-flow or is
+ * swallowed as completed with nobody having reviewed anything. Either way the authored stage
+ * never runs as drawn, which is the silent outcome this refusal exists to prevent.
  *
- * Stages *before* the declaring stage are not the rule's business: advancement is
- * forward-only, so they are already completed when the arc fires and never re-run. That is
- * what makes the ordinary shape legal — a writer stage followed by a proofreader stage that
- * returns to the writer.
+ * The rule is stage-local because the arc is: `stage.returnTo` decides where a rejection *at
+ * that stage* goes and constrains who may staff *that stage*, and it never touches the
+ * workflow-wide `returnAssignee`. Other stages — before or after — are not this arc's
+ * business, which is what keeps the ordinary shape legal: a writer stage, then a proofreader
+ * stage that returns to the writer.
  */
 function assertStageReturnTargetsHonourable(stages: IssueExecutionStage[]) {
-  for (const [declaringIndex, declaringStage] of stages.entries()) {
-    const target = declaringStage.returnTo ?? null;
+  for (const [index, stage] of stages.entries()) {
+    const target = stage.returnTo ?? null;
     if (!target) continue;
-
-    for (let index = declaringIndex; index < stages.length; index += 1) {
-      const stage = stages[index]!;
-      if (stage.participants.length === 0) continue;
-      if (!stage.participants.every((participant) => principalsEqual(participant, target))) continue;
-      throw unprocessable("Invalid execution policy", {
-        formErrors: [
-          `Stage ${declaringIndex + 1} returns to ${describePrincipal(target)}, which leaves stage ` +
-            `${index + 1} (${stage.type}) with no eligible participant: the engine excludes the return ` +
-            "target from participant selection, so that stage would never run as authored.",
-        ],
-        fieldErrors: {},
-      });
-    }
+    if (stage.participants.length === 0) continue;
+    if (!stage.participants.every((participant) => principalsEqual(participant, target))) continue;
+    throw unprocessable("Invalid execution policy", {
+      formErrors: [
+        `Stage ${index + 1} (${stage.type}) returns to ${describePrincipal(target)}, which is its ` +
+          "only participant: a stage cannot be staffed by the principal it hands rejected work " +
+          "to, so it would never run as authored.",
+      ],
+      fieldErrors: {},
+    });
   }
 }
 
@@ -516,7 +510,15 @@ function selectStageParticipant(
     exclude?: IssueExecutionStagePrincipal | null;
   },
 ): IssueExecutionStagePrincipal | null {
-  const participants = stage.participants.filter((participant) => !principalsEqual(participant, opts?.exclude ?? null));
+  // A stage never staffs its own return target: `stage.returnTo` is the principal this stage
+  // hands rejected work to, so it is on the doing side of this stage, not the judging side.
+  // This is stage-local on purpose — the arc constrains the stage that declares it and no
+  // other, which is why `returnAssignee` (the workflow-wide doer) is excluded separately and
+  // stays excluded everywhere.
+  const excluded = [opts?.exclude ?? null, stage.returnTo ?? null];
+  const participants = stage.participants.filter(
+    (participant) => !excluded.some((principal) => principalsEqual(participant, principal)),
+  );
   if (participants.length === 0) return null;
   if (opts?.preferred) {
     const preferred = participants.find((participant) => principalsEqual(participant, opts.preferred ?? null));
@@ -620,17 +622,25 @@ function buildPendingState(input: {
   };
 }
 
+/**
+ * `returnAssignee` is deliberately left untouched here. It is the workflow-wide fallback and
+ * the exclusion set the engine uses to keep an executor from reviewing its own work
+ * (`selectStageParticipant({ exclude: returnAssignee })`); writing a per-stage target into it
+ * would not fire an arc, it would permanently retarget the workflow — every later stage would
+ * inherit another stage's arc, and the original executor would silently become eligible to
+ * review the work it wrote. The arc is recorded next to it instead.
+ */
 function buildChangesRequestedState(
   previous: IssueExecutionState,
   currentStage: IssueExecutionStage,
-  returnAssignee: IssueExecutionStagePrincipal,
+  returnTarget: IssueExecutionStagePrincipal,
 ): IssueExecutionState {
   return {
     ...previous,
     status: CHANGES_REQUESTED_STATUS,
     currentStageId: currentStage.id,
     currentStageType: currentStage.type,
-    returnAssignee,
+    stageReturnAssignee: currentStage.returnTo ? returnTarget : null,
     reviewRequest: null,
     lastDecisionOutcome: "changes_requested",
   };
@@ -646,6 +656,17 @@ function stageReturnTarget(
   state: IssueExecutionState | null,
 ): IssueExecutionStagePrincipal | null {
   return stage.returnTo ?? state?.returnAssignee ?? null;
+}
+
+/**
+ * Where the work sits after a rejection: the arc target when one fired, the workflow-wide
+ * return assignee otherwise. This is what the `execution_changes_requested` wake is routed
+ * on — the arc only reaches the principal it names if the wake follows it.
+ */
+export function executionReturnTarget(
+  state: Pick<IssueExecutionState, "returnAssignee" | "stageReturnAssignee"> | null | undefined,
+): IssueExecutionStagePrincipal | null {
+  return state?.stageReturnAssignee ?? state?.returnAssignee ?? null;
 }
 
 function buildPendingStagePatch(input: {
