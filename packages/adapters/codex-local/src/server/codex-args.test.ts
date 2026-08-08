@@ -85,4 +85,62 @@ describe("buildCodexExecArgs", () => {
       "-",
     ]);
   });
+
+  it("swaps gpt-5.3-codex-spark for gpt-5.3-codex on ChatGPT-subscription auth", () => {
+    const result = buildCodexExecArgs(
+      {
+        model: "gpt-5.3-codex-spark",
+        modelReasoningEffort: "high",
+      },
+      { billingType: "subscription" },
+    );
+
+    expect(result.model).toBe("gpt-5.3-codex");
+    expect(result.modelSwappedReason).toContain("gpt-5.3-codex-spark");
+    expect(result.modelSwappedReason).toContain("ChatGPT-subscription");
+    expect(result.args).toEqual([
+      "exec",
+      "--json",
+      "--model",
+      "gpt-5.3-codex",
+      "-c",
+      'model_reasoning_effort="high"',
+      "-",
+    ]);
+  });
+
+  it("leaves gpt-5.3-codex-spark untouched on API-key auth", () => {
+    const result = buildCodexExecArgs(
+      {
+        model: "gpt-5.3-codex-spark",
+      },
+      { billingType: "api" },
+    );
+
+    expect(result.model).toBe("gpt-5.3-codex-spark");
+    expect(result.modelSwappedReason).toBeNull();
+    expect(result.args).toEqual([
+      "exec",
+      "--json",
+      "--model",
+      "gpt-5.3-codex-spark",
+      "-",
+    ]);
+  });
+
+  it("leaves gpt-5.3-codex-spark untouched when billingType is not provided", () => {
+    const result = buildCodexExecArgs({
+      model: "gpt-5.3-codex-spark",
+    });
+
+    expect(result.model).toBe("gpt-5.3-codex-spark");
+    expect(result.modelSwappedReason).toBeNull();
+    expect(result.args).toEqual([
+      "exec",
+      "--json",
+      "--model",
+      "gpt-5.3-codex-spark",
+      "-",
+    ]);
+  });
 });

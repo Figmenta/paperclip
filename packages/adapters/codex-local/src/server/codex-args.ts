@@ -1,8 +1,15 @@
 import { asBoolean, asString, asStringArray } from "@paperclipai/adapter-utils/server-utils";
 import {
   CODEX_LOCAL_FAST_MODE_SUPPORTED_MODELS,
+  DEFAULT_CODEX_LOCAL_MODEL,
   isCodexLocalFastModeSupported,
 } from "../index.js";
+
+// `gpt-5.3-codex-spark` is the Paperclip "cheap" modelProfile model, but
+// ChatGPT-subscription auth rejects it with a 400 ("not supported when using
+// codex with a ChatGPT account"). On subscription auth, fall back to the
+// adapter's default model so the run still proceeds instead of failing fast.
+const CODEX_SPARK_MODEL_ID = "gpt-5.3-codex-spark";
 
 export type BuildCodexExecArgsResult = {
   args: string[];
@@ -10,6 +17,7 @@ export type BuildCodexExecArgsResult = {
   fastModeRequested: boolean;
   fastModeApplied: boolean;
   fastModeIgnoredReason: string | null;
+  modelSwappedReason: string | null;
 };
 
 function readExtraArgs(config: unknown): string[] {
@@ -33,22 +41,36 @@ export function buildCodexExecArgs(
   options: {
     resumeSessionId?: string | null;
     skipGitRepoCheck?: boolean;
+    billingType?: "api" | "subscription" | null;
   } = {},
 ): BuildCodexExecArgsResult {
   const record = asRecord(config);
-  const model = asString(record.model, "").trim();
+  const requestedModel = asString(record.model, "").trim();
   const modelReasoningEffort = asString(
     record.modelReasoningEffort,
     asString(record.reasoningEffort, ""),
   ).trim();
   const search = asBoolean(record.search, false);
-  const fastModeRequested = asBoolean(record.fastMode, false);
-  const fastModeApplied = fastModeRequested && isCodexLocalFastModeSupported(model);
   const bypass = asBoolean(
     record.dangerouslyBypassApprovalsAndSandbox,
     asBoolean(record.dangerouslyBypassSandbox, false),
   );
   const extraArgs = readExtraArgs(record);
+
+  let model = requestedModel;
+  let modelSwappedReason: string | null = null;
+  if (
+    requestedModel === CODEX_SPARK_MODEL_ID &&
+    options.billingType === "subscription"
+  ) {
+    model = DEFAULT_CODEX_LOCAL_MODEL;
+    modelSwappedReason =
+      `Configured model "${CODEX_SPARK_MODEL_ID}" is not supported on ChatGPT-subscription auth; ` +
+      `Paperclip substituted "${DEFAULT_CODEX_LOCAL_MODEL}" for this run.`;
+  }
+
+  const fastModeRequested = asBoolean(record.fastMode, false);
+  const fastModeApplied = fastModeRequested && isCodexLocalFastModeSupported(model);
 
   const args = ["exec", "--json"];
   if (options.skipGitRepoCheck) args.push("--skip-git-repo-check");
@@ -74,5 +96,6 @@ export function buildCodexExecArgs(
       fastModeRequested && !fastModeApplied
         ? `Configured fast mode is currently only supported on ${formatFastModeSupportedModels()}; Paperclip will ignore it for model ${model || "(default)"}.`
         : null,
+    modelSwappedReason,
   };
 }
