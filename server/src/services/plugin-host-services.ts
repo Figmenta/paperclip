@@ -1788,7 +1788,11 @@ export function buildHostServices(
           throw new Error(`Issue is not wakeable in status: ${issue.status}`);
         }
         const relations = await issues.getRelationSummaries(issue.id);
-        const unresolvedBlockers = relations.blockedBy.filter((blocker) => blocker.status !== "done");
+        // Terminal blockers (done OR cancelled) are resolved; only non-terminal
+        // blockers keep a dependent unwakeable. (FIG-1466)
+        const unresolvedBlockers = relations.blockedBy.filter(
+          (blocker) => blocker.status !== "done" && blocker.status !== "cancelled",
+        );
         if (unresolvedBlockers.length > 0) {
           throw new Error("Issue is blocked by unresolved blockers");
         }
@@ -1856,7 +1860,11 @@ export function buildHostServices(
             throw new Error(`Issue is not wakeable in status: ${issue.status}`);
           }
           const relations = await issues.getRelationSummaries(issue.id);
-          const unresolvedBlockers = relations.blockedBy.filter((blocker) => blocker.status !== "done");
+          // Terminal blockers (done OR cancelled) are resolved; only non-terminal
+        // blockers keep a dependent unwakeable. (FIG-1466)
+        const unresolvedBlockers = relations.blockedBy.filter(
+          (blocker) => blocker.status !== "done" && blocker.status !== "cancelled",
+        );
           if (unresolvedBlockers.length > 0) {
             throw new Error("Issue is blocked by unresolved blockers");
           }

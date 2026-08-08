@@ -4310,8 +4310,13 @@ export function issueRoutes(
         }
       }
 
-      const becameDone = existing.status !== "done" && issue.status === "done";
-      if (becameDone) {
+      // A blocker resolves its dependents when it reaches a terminal state —
+      // `done` OR `cancelled`. Cancelling superseded upstream work must release
+      // (and wake) its dependents exactly as completing it would, instead of
+      // freezing them until the relation is edited by hand. (FIG-1466)
+      const becameResolvedBlocker =
+        !isClosedIssueStatus(existing.status) && isClosedIssueStatus(issue.status);
+      if (becameResolvedBlocker) {
         const dependents = await svc.listWakeableBlockedDependents(issue.id);
         for (const dependent of dependents) {
           addWakeup(dependent.assigneeAgentId, {
